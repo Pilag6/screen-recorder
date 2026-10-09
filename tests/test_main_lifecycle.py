@@ -10,11 +10,19 @@ from engine.lifecycle import SavedRecording
 from unittest.mock import Mock, patch
 
 
+class InertApplication:
+    def __init__(self, **kwargs):
+        self.application_id = kwargs.get('application_id')
+        self.add_window = Mock()
+        self.quit = Mock()
+
+
 def load_main():
     gi = ModuleType('gi')
     gi.require_version = Mock()
     repository = ModuleType('gi.repository')
-    repository.Gtk = SimpleNamespace(Window=object, main_quit=Mock())
+    repository.Gtk = SimpleNamespace(Window=object, Application=InertApplication,
+                                     main_quit=Mock())
     repository.Gdk = SimpleNamespace()
     repository.GLib = SimpleNamespace(idle_add=Mock(), timeout_add_seconds=Mock())
     spec = importlib.util.spec_from_file_location('tested_main', 'main.py')
@@ -34,6 +42,8 @@ class MainTests(unittest.TestCase):
         self.ui.status = Mock()
         self.ui.source_container = Mock()
         self.ui.audio = self.ui.fps = self.ui.quality = {'x': Mock()}
+        self.application = Mock()
+        self.ui.get_application = Mock(return_value=self.application)
         self.ui.show_all = Mock()
         self.ui.hide = Mock()
         self.ui.iconify = Mock()
@@ -56,10 +66,10 @@ class MainTests(unittest.TestCase):
     def test_close_defers_quit_until_cleanup_callback(self):
         self.assertTrue(self.ui.on_close(None, None))
         self.ui.lifecycle.close.assert_called_once()
-        self.module.Gtk.main_quit.assert_not_called()
+        self.application.quit.assert_not_called()
         self.ui.lifecycle.state = 'closed'
         self.ui.on_lifecycle_state('closed', 'Closed', None)
-        self.module.Gtk.main_quit.assert_called_once()
+        self.application.quit.assert_called_once()
 
     def test_stale_monitor_results_do_not_update_busy_or_closed_ui(self):
         self.ui.refresh_monitors = Mock()
@@ -107,7 +117,7 @@ class MainTests(unittest.TestCase):
         self.ui.on_lifecycle_state('cleanup_failed', 'Cleanup error', None)
         self.ui.show_all.assert_called_once()
         self.ui.start_button.set_label.assert_called_with('Retry cleanup')
-        self.module.Gtk.main_quit.assert_not_called()
+        self.application.quit.assert_not_called()
 
     def test_elapsed_timer_warned_and_preserves_audio_status(self):
         self.ui.lifecycle.state = 'recording'
@@ -239,7 +249,7 @@ class MainTests(unittest.TestCase):
         self.ui.lifecycle.completion = SavedRecording(1, Path('real.mkv'))
         self.ui.notifier.close.side_effect = lambda: calls.append('disarm')
         self.ui.notifier.notify_saved.side_effect = lambda *a, **kw: calls.append('notify')
-        self.module.Gtk.main_quit.side_effect = lambda: calls.append('quit')
+        self.application.quit.side_effect = lambda: calls.append('quit')
         with patch('pathlib.Path.is_file', return_value=True):
             self.ui.on_lifecycle_state('closed', 'Saved')
         self.assertEqual(calls, ['disarm', 'notify', 'quit'])
@@ -250,3 +260,70 @@ class MainTests(unittest.TestCase):
         with patch.object(self.module.subprocess, 'run', return_value=result):
             monitors = self.module.get_connected_monitors()
         self.assertEqual((monitors[0]['x'], monitors[0]['y']), (-100, 20))
+
+
+class ApplicationTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_main()
+        self.window = Mock()
+        self.window.lifecycle = SimpleNamespace(state='idle', closed=False, token=7)
+        self.factory = patch.object(self.module, 'ScreenRecorder', return_value=self.window)
+        self.factory_mock = self.factory.start()
+        self.addCleanup(self.factory.stop)
+        self.application = self.module.ScreenRecorderApplication()
+
+    def test_application_id_is_stable_and_window_creation_is_lazy(self):
+        self.assertEqual(self.application.application_id,
+                         'io.github.screenrecorder.ScreenRecorder')
+        self.factory_mock.assert_not_called()
+        self.application.add_window.assert_not_called()
+        self.application.do_activate()
+        self.factory_mock.assert_called_once_with()
+        self.application.add_window.assert_called_once_with(self.window)
+
+    def test_repeated_activation_restores_and_presents_same_window(self):
+        for _ in range(3):
+            self.application.do_activate()
+        self.factory_mock.assert_called_once_with()
+        self.application.add_window.assert_called_once_with(self.window)
+        self.assertIs(self.application.window, self.window)
+        self.assertEqual(self.window.method_calls,
+                         [call for _ in range(3) for call in
+                          [('show_all', (), {}), ('deiconify', (), {}), ('present', (), {})]])
+
+    def test_activation_preserves_countdown_and_recording_objects_and_state(self):
+        for state in ('countdown', 'recording'):
+            with self.subTest(state=state):
+                self.window.lifecycle.state = state
+                lifecycle, engine = self.window.lifecycle, self.window.engine
+                self.application.do_activate()
+                self.assertIs(self.window.lifecycle, lifecycle)
+                self.assertIs(self.window.engine, engine)
+                self.assertEqual((lifecycle.state, lifecycle.token), (state, 7))
+                self.window.on_record_clicked.assert_not_called()
+                self.window.start_recording.assert_not_called()
+                self.window.stop_recording.assert_not_called()
+        self.factory_mock.assert_called_once_with()
+
+    def test_activation_during_close_does_not_recreate_or_quit(self):
+        self.application.do_activate()
+        self.window.reset_mock()
+        self.window.lifecycle.closed = True
+        for state in ('stopping', 'closed'):
+            self.window.lifecycle.state = state
+            self.application.do_activate()
+        self.factory_mock.assert_called_once_with()
+        self.window.show_all.assert_not_called()
+        self.application.quit.assert_not_called()
+
+    def test_cleanup_failure_can_restore_existing_window(self):
+        self.application.do_activate()
+        self.window.reset_mock()
+        self.window.lifecycle.closed = True
+        self.window.lifecycle.state = 'cleanup_failed'
+        self.application.do_activate()
+        self.factory_mock.assert_called_once_with()
+        self.window.show_all.assert_called_once_with()
+        self.window.deiconify.assert_called_once_with()
+        self.window.present.assert_called_once_with()
+        self.application.quit.assert_not_called()

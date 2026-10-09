@@ -2,6 +2,7 @@
 
 import re
 import subprocess
+import sys
 import threading
 import time
 
@@ -425,7 +426,7 @@ class ScreenRecorder(Gtk.Window):
             self.notify_completion()
             if 'error' in message.lower():
                 print(message)
-            Gtk.main_quit()
+            self.get_application().quit()
             return
         if self.lifecycle.closed and state not in ('cleanup_failed', 'stopping'):
             return
@@ -478,7 +479,22 @@ class ScreenRecorder(Gtk.Window):
         dialog.destroy()
 
 
+class ScreenRecorderApplication(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.screenrecorder.ScreenRecorder")
+        self.window = None
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = ScreenRecorder()
+            self.add_window(self.window)
+        # Keep the registered window alive until asynchronous cleanup completes.
+        if self.window.lifecycle.closed and self.window.lifecycle.state != 'cleanup_failed':
+            return
+        self.window.show_all()
+        self.window.deiconify()
+        self.window.present()
+
+
 if __name__ == "__main__":
-    window = ScreenRecorder()
-    window.show_all()
-    Gtk.main()
+    sys.exit(ScreenRecorderApplication().run(sys.argv))
