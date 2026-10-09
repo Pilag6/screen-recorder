@@ -3,7 +3,10 @@ import importlib.util
 import sys
 import threading
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
+
+from engine.lifecycle import SavedRecording
 from unittest.mock import Mock, patch
 
 
@@ -33,6 +36,12 @@ class MainTests(unittest.TestCase):
         self.ui.audio = self.ui.fps = self.ui.quality = {'x': Mock()}
         self.ui.show_all = Mock()
         self.ui.hide = Mock()
+        self.ui.iconify = Mock()
+        self.ui.set_title = Mock()
+        self.ui.notifier = Mock()
+        self.ui._iconified_token = None
+        self.ui._notified_token = None
+        self.ui.lifecycle.completion = None
         self.ui.monitors = []
         self.ui._monitor_pending = False
         self.ui._monitor_generation = 0
@@ -48,6 +57,7 @@ class MainTests(unittest.TestCase):
         self.assertTrue(self.ui.on_close(None, None))
         self.ui.lifecycle.close.assert_called_once()
         self.module.Gtk.main_quit.assert_not_called()
+        self.ui.lifecycle.state = 'closed'
         self.ui.on_lifecycle_state('closed', 'Closed', None)
         self.module.Gtk.main_quit.assert_called_once()
 
@@ -106,6 +116,134 @@ class MainTests(unittest.TestCase):
         with patch.object(self.module.time, 'monotonic', return_value=71):
             self.ui.check_recording_status()
         self.ui.status.set_text.assert_called_with('REC 00:01:01 — Recording... Audio: both')
+
+    def test_recording_title_tracks_elapsed_timer_and_preserves_status(self):
+        self.ui.lifecycle.state = 'recording'
+        self.ui.lifecycle.started_at = 10
+        self.ui.lifecycle.indicator_reason = 'REC helper available'
+        with patch.object(self.module.time, 'monotonic', return_value=10):
+            self.ui.on_lifecycle_state('recording', 'Recording... Audio: both')
+        self.ui.set_title.assert_called_with('REC 00:00:00 — Screen Recorder')
+        for now, elapsed in ((71, '00:01:01'), (3671, '01:01:01'), (9, '00:00:00')):
+            with self.subTest(now=now), \
+                 patch.object(self.module.time, 'monotonic', return_value=now):
+                self.assertTrue(self.ui.check_recording_status())
+                self.ui.set_title.assert_called_with(f'REC {elapsed} — Screen Recorder')
+                self.ui.status.set_text.assert_called_with(
+                    f'REC {elapsed} — Recording... Audio: both'
+                )
+        self.ui.notifier.notify_saved.assert_not_called()
+
+    def test_nonrecording_states_reset_title_and_timer_does_not_restore_rec(self):
+        for state in ('selecting', 'countdown', 'starting', 'stopping',
+                      'cleanup_failed', 'idle', 'closed'):
+            with self.subTest(state=state):
+                self.ui.lifecycle.state = 'recording'
+                self.ui.lifecycle.started_at = 10
+                self.ui.lifecycle.indicator_reason = 'REC'
+                with patch.object(self.module.time, 'monotonic', return_value=71):
+                    self.ui.on_lifecycle_state('recording', 'Recording')
+                self.ui.set_title.reset_mock()
+                self.ui.lifecycle.state = state
+                self.ui.on_lifecycle_state(state, state)
+                self.ui.set_title.assert_called_with('Screen Recorder')
+                self.ui.set_title.reset_mock()
+                self.ui.check_recording_status()
+                self.ui.set_title.assert_not_called()
+
+    def test_fallback_title_and_tooltip_do_not_reiconify_restored_window(self):
+        self.ui.lifecycle.state = 'recording'
+        self.ui.lifecycle.started_at = 10
+        for reason in ('REC helper absent', 'REC launch failed', 'REC exited (1)'):
+            with self.subTest(reason=reason):
+                self.ui.lifecycle.token += 1
+                self.ui.lifecycle.indicator_reason = reason
+                self.ui.iconify.reset_mock()
+                with patch.object(self.module.time, 'monotonic', return_value=10):
+                    self.ui.on_lifecycle_state('recording', 'Recording — REC fallback')
+                self.ui.iconify.assert_called_once()
+                # The user restored the window before a repeated fallback callback.
+                with patch.object(self.module.time, 'monotonic', return_value=71):
+                    self.ui.on_lifecycle_state('recording', 'Recording — REC fallback')
+                self.ui.iconify.assert_called_once()
+                self.ui.set_title.assert_called_with('REC 00:01:01 — Screen Recorder')
+                tooltip = self.ui.status.set_tooltip_text.call_args.args[0]
+                self.assertIn(reason, tooltip)
+                self.assertIn('window title', tooltip.lower())
+                self.assertIn('restore', tooltip.lower())
+                self.assertIn('stop recording', tooltip.lower())
+        self.ui.show_all.assert_not_called()
+        self.ui.hide.assert_not_called()
+        self.ui.notifier.notify_saved.assert_not_called()
+        self.ui.on_record_clicked(None)
+        self.ui.lifecycle.cancel.assert_called_once()
+
+    def test_recording_iconifies_once_without_hiding_or_representing(self):
+        self.ui.lifecycle.token = 1
+        self.ui.lifecycle.indicator_reason = 'REC'
+        for state in ('selecting', 'countdown', 'starting'):
+            self.ui.lifecycle.state = state
+            self.ui.on_lifecycle_state(state, state)
+        self.ui.iconify.assert_not_called()
+        self.ui.show_all.reset_mock()
+        self.ui.hide.reset_mock()
+        self.ui.lifecycle.state = 'recording'
+        self.ui.on_lifecycle_state('recording', 'Recording')
+        self.ui.on_lifecycle_state('recording', 'Overlay fallback')
+        self.ui.iconify.assert_called_once()
+        self.ui.show_all.assert_not_called()
+        self.ui.hide.assert_not_called()
+        self.ui.on_record_clicked(None)  # Restored window still permits Stop.
+        self.ui.lifecycle.cancel.assert_called_once()
+        self.ui.lifecycle.token = 2
+        self.ui.on_lifecycle_state('recording', 'Recording again')
+        self.assertEqual(self.ui.iconify.call_count, 2)
+
+    def test_notifications_require_metadata_and_existing_file(self):
+        self.ui.lifecycle.state = 'idle'
+        with patch('pathlib.Path.is_file', return_value=True):
+            self.ui.on_lifecycle_state('idle', 'Saved: fake.mkv', Path('fake.mkv'))
+            self.ui.notifier.notify_saved.assert_not_called()
+            self.ui.lifecycle.completion = SavedRecording(1, Path('real.mkv'))
+            self.ui.on_lifecycle_state('idle', 'Anything', Path('fake.mkv'))
+            self.ui.on_lifecycle_state('idle', 'Duplicate')
+        self.ui.notifier.notify_saved.assert_called_once_with(Path('real.mkv'), allow_actions=True)
+        self.ui.lifecycle.completion = SavedRecording(2, Path('gone.mkv'))
+        with patch('pathlib.Path.is_file', return_value=False):
+            self.ui.on_lifecycle_state('idle', 'Saved')
+        self.assertEqual(self.ui.notifier.notify_saved.call_count, 1)
+        self.ui.lifecycle.state = 'countdown'
+        self.ui.on_lifecycle_state('idle', 'Stale completion')
+        self.assertEqual(self.ui.notifier.notify_saved.call_count, 1)
+
+    def test_stale_recording_dispatch_and_file_recheck_error_are_inert(self):
+        self.ui.lifecycle.state = 'stopping'
+        self.ui.on_lifecycle_state('recording', 'Stale REC')
+        self.ui.iconify.assert_not_called()
+        self.ui.show_all.assert_not_called()
+        self.ui.set_title.assert_not_called()
+        self.ui.lifecycle.completion = SavedRecording(1, Path('real.mkv'))
+        for state in ('stopping', 'cleanup_failed'):
+            self.ui.lifecycle.state = state
+            self.ui.on_lifecycle_state(state, 'Saved: misleading.mkv')
+        self.ui.notifier.notify_saved.assert_not_called()
+        self.ui.lifecycle.state = 'idle'
+        with patch('pathlib.Path.is_file', side_effect=OSError('unavailable')):
+            self.ui.on_lifecycle_state('idle', 'Saved')
+        self.ui.notifier.notify_saved.assert_not_called()
+
+    def test_close_notification_precedes_quit_and_has_no_action(self):
+        calls = []
+        self.ui.lifecycle.closed = True
+        self.ui.lifecycle.state = 'closed'
+        self.ui.lifecycle.completion = SavedRecording(1, Path('real.mkv'))
+        self.ui.notifier.close.side_effect = lambda: calls.append('disarm')
+        self.ui.notifier.notify_saved.side_effect = lambda *a, **kw: calls.append('notify')
+        self.module.Gtk.main_quit.side_effect = lambda: calls.append('quit')
+        with patch('pathlib.Path.is_file', return_value=True):
+            self.ui.on_lifecycle_state('closed', 'Saved')
+        self.assertEqual(calls, ['disarm', 'notify', 'quit'])
+        self.ui.notifier.notify_saved.assert_called_once_with(Path('real.mkv'), allow_actions=False)
 
     def test_negative_monitor_offsets_parsed(self):
         result = Mock(stdout='Monitors: 1\n 0: +DP-1 101/1x99/1-100+20 DP-1\n')

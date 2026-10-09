@@ -103,6 +103,7 @@ class LifecycleTests(unittest.TestCase):
         self.finish()
         self.engine.start.assert_not_called()
         self.assertEqual(self.life.state, 'idle')
+        self.assertIsNone(self.life.completion)
         self.assertTrue(any(c[0] == 'wait' for c in self.countdown.calls))
 
     def test_close_invalidates_queued_authorization(self):
@@ -155,6 +156,7 @@ class LifecycleTests(unittest.TestCase):
         self.finish()
         self.engine.stop.assert_called_once()
         self.assertNotIn('recording', [s[0] for s in self.states])
+        self.assertIsNone(self.life.completion)
 
     def test_unexpected_exit_cleans_and_reports(self):
         self.engine.is_recording.return_value = False
@@ -340,6 +342,97 @@ class LifecycleTests(unittest.TestCase):
         self.finish()
         self.assertIn('error', self.states[-1][1].lower())
         self.assertNotIn('Saved:', self.states[-1][1])
+
+    def test_success_metadata_published_only_after_stop_and_cleanup(self):
+        self.life.begin(self.options)
+        self.authorize()
+        self.next_callback()
+        self.assertIsNone(self.life.completion)
+        self.life.cancel()
+        self.life.worker.join(2)
+        self.assertIsNone(self.life.completion)  # GTK has not accepted completion yet.
+        self.finish()
+        self.assertEqual(self.life.completion.output, self.engine.stop.return_value)
+        self.assertEqual(self.life.completion.token, 1)
+        self.assertFalse(self.indicator.poll() is None)
+        self.life.begin(self.options)
+        self.assertIsNone(self.life.completion)
+        self.life.cancel()
+        self.finish()
+        self.assertIsNone(self.life.completion)
+
+    def test_close_after_recording_publishes_success_before_closed_callback(self):
+        observed = []
+        self.life.on_state = lambda *args: observed.append((args[0], self.life.completion))
+        self.life.begin(self.options)
+        self.authorize()
+        self.next_callback()
+        self.life.close()
+        self.finish()
+        self.assertEqual(observed[-1][0], 'closed')
+        self.assertEqual(observed[-1][1].output, Path('recording.mkv'))
+
+    def test_successful_completion_replay_cannot_publish_into_new_session(self):
+        self.life.begin(self.options)
+        self.authorize()
+        self.next_callback()
+        self.life.cancel()
+        self.life.worker.join(2)
+        complete = self.queue.get(timeout=2)
+        complete()
+        self.assertIsNotNone(self.life.completion)
+        self.life.begin(self.options)
+        current = self.life.session
+        complete()
+        self.assertIs(self.life.session, current)
+        self.assertIsNone(self.life.completion)
+        self.assertEqual(self.life.state, 'countdown')
+        self.life.cancel()
+        self.finish()
+
+    def test_cleanup_error_even_after_reaping_suppresses_success(self):
+        cleanup = OwnedProcesses.cleanup
+        def fail_after_cleanup(owner):
+            cleanup(owner)
+            raise OSError('stream cleanup failed')
+        with patch.object(OwnedProcesses, 'cleanup', fail_after_cleanup):
+            self.life.begin(self.options)
+            self.authorize()
+            self.next_callback()
+            self.life.cancel()
+            self.finish()
+        self.assertEqual(self.life.state, 'idle')
+        self.assertIsNone(self.life.completion)
+        self.assertIn('Cleanup error', self.states[-1][1])
+
+    def test_completion_negative_cases(self):
+        for failure in ('empty', 'forced', 'unexpected', 'startup', 'cleanup'):
+            with self.subTest(failure=failure):
+                self.engine.stop.side_effect = None
+                self.engine.stop.return_value = Path('recording.mkv')
+                self.engine.is_recording.return_value = failure != 'startup'
+                self.indicator = Child()
+                if failure == 'empty':
+                    self.engine.stop.return_value = None
+                if failure == 'forced':
+                    self.engine.stop.side_effect = RuntimeError('forced stop')
+                if failure == 'cleanup':
+                    self.indicator.wait = Mock(side_effect=OSError('cleanup failed'))
+                self.life.begin(self.options)
+                self.authorize()
+                if failure != 'startup':
+                    self.next_callback()
+                    if failure == 'unexpected':
+                        self.engine.is_recording.return_value = False
+                    else:
+                        self.life.cancel()
+                self.finish()
+                self.assertIsNone(self.life.completion)
+                if failure == 'cleanup':
+                    self.indicator.wait = Mock(return_value=0)
+                    self.life.retry_cleanup()
+                    self.finish()
+                    self.assertIsNone(self.life.completion)
 
     def test_double_start_and_restart_while_stopping_are_rejected(self):
         self.life.begin(self.options)

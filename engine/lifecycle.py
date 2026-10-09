@@ -89,6 +89,14 @@ class OwnedProcesses:
             raise RuntimeError('Child cleanup failed: ' + '; '.join(errors))
 
 
+@dataclass(frozen=True)
+class SavedRecording:
+    """Confirmed engine save, published only after successful ownership cleanup."""
+
+    token: int
+    output: Path
+
+
 @dataclass
 class Session:
     token: int
@@ -115,6 +123,7 @@ class RecordingLifecycle:
         self.started_at = None
         self.indicator_reason = ''
         self.cleanup_owner = None
+        self.completion = None
 
     def _set_state(self, state, message, output=None):
         self.state = state
@@ -135,6 +144,7 @@ class RecordingLifecycle:
         self.token += 1
         session = Session(self.token)
         self.session = session
+        self.completion = None
         self.started_at = None
         state = 'selecting' if options.source == 'region' else 'countdown'
         self._set_state(state, 'Select a screen region...' if state == 'selecting'
@@ -175,9 +185,10 @@ class RecordingLifecycle:
             self._set_state('starting', 'Starting recording...')
             session.authorized.set()
 
-    def _complete(self, session, owner, message, output):
+    def _complete(self, session, owner, message, output, completion=None):
         if self.session is not session:
             return False
+        self.completion = None
         self.started_at = None
         if owner.children:
             # Do NOT quit GTK or allow another recording with unreaped children.
@@ -186,6 +197,7 @@ class RecordingLifecycle:
         else:
             self.session = None
             self.cleanup_owner = None
+            self.completion = completion
             self._set_state('closed' if self.closed else 'idle', message, output)
         return False
 
@@ -211,6 +223,8 @@ class RecordingLifecycle:
         owner = OwnedProcesses()
         output = None
         started = False
+        recording_confirmed = False
+        save_requested = False
         message = 'Recording cancelled'
         try:
             check_cancel(session.cancel)
@@ -250,6 +264,7 @@ class RecordingLifecycle:
             check_cancel(session.cancel)
             if not self.engine.is_recording():
                 raise RuntimeError('Recording process ended unexpectedly during startup')
+            recording_confirmed = True
             warnings = []
             if options.source == 'region':
                 try:
@@ -297,18 +312,19 @@ class RecordingLifecycle:
                     self._post(session, lambda: self._set_state(
                         'recording', status + ' — Border helper exited', output))
             else:
-                message = f'Saved: {output.name}'
+                save_requested = True
         except Cancelled:
-            if started and output:
-                message = f'Saved: {output.name}'
+            save_requested = recording_confirmed
         except Exception as error:
             message = f'Recording error: {error}'
         finally:
             errors = []
+            saved = None
+            completion = None
             if started:
                 try:
                     saved = self.engine.stop()
-                    if message.startswith('Saved:'):
+                    if save_requested:
                         message = f'Saved: {saved.name}' if saved else 'No recording was saved'
                 except Exception as error:
                     errors.append(str(error))
@@ -318,4 +334,9 @@ class RecordingLifecycle:
                 errors.append(str(error))
             if errors:
                 message = 'Cleanup error: ' + '; '.join(errors)
-            self.dispatch(lambda: self._complete(session, owner, message, output))
+            elif (save_requested and saved is not None and not owner.children
+                  and 'ffmpeg' not in owner.escalated):
+                # stop() validates exit status, nonempty output and no forced stop.
+                # Never derive success from a display message or start()'s path.
+                completion = SavedRecording(session.token, saved)
+            self.dispatch(lambda: self._complete(session, owner, message, output, completion))

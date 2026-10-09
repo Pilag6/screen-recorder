@@ -13,6 +13,7 @@ from gi.repository import Gtk, Gdk, GLib
 from recorder import RecordingOptions
 from engine.recording import RecordingEngine
 from engine.lifecycle import RecordingLifecycle
+from engine.notifications import DesktopNotifier
 
 
 MONITOR_NAMES = {
@@ -71,6 +72,9 @@ class ScreenRecorder(Gtk.Window):
         super().__init__(title="Screen Recorder")
 
         self.engine = RecordingEngine()
+        self.notifier = DesktopNotifier()
+        self._iconified_token = None
+        self._notified_token = None
         self.lifecycle = RecordingLifecycle(
             self.engine, GLib.idle_add, self.on_lifecycle_state,
         )
@@ -78,8 +82,8 @@ class ScreenRecorder(Gtk.Window):
         self._monitor_generation = 0
         self.recording_status = ''
 
-        self.set_default_size(440, 420)
-        self.set_border_width(24)
+        self.set_default_size(420, 460)
+        self.set_border_width(18)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("delete-event", self.on_close)
 
@@ -89,32 +93,20 @@ class ScreenRecorder(Gtk.Window):
         )
         self.add(main)
 
-        # Screen source
-        main.pack_start(
-            self.create_label("SCREEN SOURCE"),
-            False, False, 0,
-        )
-
+        # Keep section headings outside the controls disabled during a session.
+        source_section = self.create_section(main, "Screen source")
         self.source_container = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
         )
-        main.pack_start(
-            self.source_container,
-            False, False, 0,
-        )
+        source_section.pack_start(self.source_container, False, False, 0)
 
         self.source = {}
         self.monitors = []
         self.refresh_monitors()
 
-        # Audio source
-        main.pack_start(
-            self.create_label("AUDIO SOURCE"),
-            False, False, 0,
-        )
-
+        audio_section = self.create_section(main, "Audio source")
         self.audio = self.create_radio_group(
-            main,
+            audio_section,
             [
                 ("none", "No audio"),
                 ("system", "System audio"),
@@ -125,40 +117,14 @@ class ScreenRecorder(Gtk.Window):
             columns=2,
         )
 
-        # Video settings
-        main.pack_start(
-            self.create_label("VIDEO SETTINGS"),
-            False, False, 0,
-        )
-
         settings = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=40,
+            spacing=16,
+            homogeneous=True,
         )
         main.pack_start(settings, False, False, 0)
-
-        fps_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=5,
-        )
-
-        quality_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=5,
-        )
-
-        settings.pack_start(fps_box, True, True, 0)
-        settings.pack_start(quality_box, True, True, 0)
-
-        fps_box.pack_start(
-            self.create_label("Frame rate"),
-            False, False, 0,
-        )
-
-        quality_box.pack_start(
-            self.create_label("Quality"),
-            False, False, 0,
-        )
+        fps_box = self.create_section(settings, "Frame rate", expand=True)
+        quality_box = self.create_section(settings, "Quality", expand=True)
 
         self.fps = self.create_radio_group(
             fps_box,
@@ -180,23 +146,25 @@ class ScreenRecorder(Gtk.Window):
             columns=1,
         )
 
-        # Output folder
-        main.pack_start(
-            self.create_label("OUTPUT FOLDER"),
+        output_section = self.create_section(main, "Save to")
+        folder = self.create_label("~/Videos/Recordings")
+        folder.set_selectable(True)
+        output_section.pack_start(folder, False, False, 0)
+
+        # A separate footer keeps feedback next to the session action.
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        main.pack_end(footer, False, False, 0)
+        footer.pack_start(
+            Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
             False, False, 0,
         )
-
-        folder = Gtk.Label(
-            label="~/Videos/Recordings"
-        )
-        folder.set_xalign(0)
-        main.pack_start(folder, False, False, 0)
-
-        # Status
-        self.status = Gtk.Label(label="Ready to record")
-        self.status.set_xalign(0)
+        status_section = self.create_section(footer, "Status")
+        self.status = self.create_label("Ready to record")
         self.status.set_line_wrap(True)
-        main.pack_start(self.status, False, False, 0)
+        self.status.set_max_width_chars(44)
+        self.status.set_selectable(True)
+        self.status.get_accessible().set_name("Recording status")
+        status_section.pack_start(self.status, False, False, 0)
 
         # Recording button
         self.start_button = Gtk.Button(
@@ -221,10 +189,7 @@ class ScreenRecorder(Gtk.Window):
             self.on_button_leave,
         )
 
-        main.pack_end(
-            self.start_button,
-            False, False, 0,
-        )
+        footer.pack_start(self.start_button, False, False, 0)
 
         self.update_button()
 
@@ -244,6 +209,16 @@ class ScreenRecorder(Gtk.Window):
         label.set_xalign(0)
         return label
 
+    def create_section(self, container, title, expand=False):
+        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        section.get_accessible().set_name(title)
+        heading = self.create_label(title)
+        # Weight only: font size, colors and focus rendering belong to the theme.
+        heading.set_markup(f'<b>{GLib.markup_escape_text(title)}</b>')
+        section.pack_start(heading, False, False, 0)
+        container.pack_start(section, expand, expand, 0)
+        return section
+
     def create_radio_group(
         self, container, options, default, columns=2
     ):
@@ -251,8 +226,8 @@ class ScreenRecorder(Gtk.Window):
         first = None
 
         grid = Gtk.Grid()
-        grid.set_column_spacing(24)
-        grid.set_row_spacing(8)
+        grid.set_column_spacing(16)
+        grid.set_row_spacing(6)
         grid.set_column_homogeneous(True)
 
         container.pack_start(grid, False, False, 0)
@@ -377,9 +352,9 @@ class ScreenRecorder(Gtk.Window):
             elapsed = max(0, int(time.monotonic() - self.lifecycle.started_at))
             hours, remainder = divmod(elapsed, 3600)
             minutes, seconds = divmod(remainder, 60)
-            self.status.set_text(
-                f'REC {hours:02}:{minutes:02}:{seconds:02} — {self.recording_status}'
-            )
+            recording_time = f'REC {hours:02}:{minutes:02}:{seconds:02}'
+            self.set_title(f'{recording_time} — Screen Recorder')
+            self.status.set_text(f'{recording_time} — {self.recording_status}')
         return True
 
     def set_controls_enabled(self, enabled):
@@ -427,8 +402,27 @@ class ScreenRecorder(Gtk.Window):
         except Exception as error:
             self.status.set_text(f'Recording error: {error}')
 
+    def notify_completion(self):
+        completion = self.lifecycle.completion
+        if completion is None or completion.token == self._notified_token:
+            return
+        # Consume once, even if the file disappeared or the desktop is unavailable.
+        self._notified_token = completion.token
+        try:
+            exists = completion.output.is_file()
+        except OSError:
+            exists = False
+        if exists:
+            self.notifier.notify_saved(completion.output, allow_actions=not self.lifecycle.closed)
+
     def on_lifecycle_state(self, state, message, output=None):
+        if state != self.lifecycle.state:
+            return
+        if state != 'recording':
+            self.set_title('Screen Recorder')
         if state == 'closed':
+            self.notifier.close()
+            self.notify_completion()
             if 'error' in message.lower():
                 print(message)
             Gtk.main_quit()
@@ -437,12 +431,22 @@ class ScreenRecorder(Gtk.Window):
             return
         if state == 'selecting' or (self.lifecycle.closed and state == 'stopping'):
             self.hide()
-        else:
+        elif state != 'recording':
             self.show_all()
+        if state == 'idle':
+            self.notify_completion()
         self.status.set_text(message)
         self.recording_status = message
         if state == 'recording':
-            self.status.set_tooltip_text(self.lifecycle.indicator_reason)
+            if self._iconified_token != self.lifecycle.token:
+                self._iconified_token = self.lifecycle.token
+                self.iconify()
+            self.status.set_tooltip_text(
+                f'{self.lifecycle.indicator_reason}\n'
+                'If the REC helper is unavailable, recording time remains in the '
+                'window title (visible in window lists with titles enabled). '
+                'Restore this window to Stop Recording.'
+            )
             print(self.lifecycle.indicator_reason)
             print(f'Recording started: {output}')
             self.check_recording_status()
@@ -455,6 +459,7 @@ class ScreenRecorder(Gtk.Window):
 
     def on_close(self, widget, event):
         # Keep the GTK loop alive while the session worker cleans up. No waits here.
+        self.notifier.close()
         self.hide()
         self.lifecycle.close()
         return True
