@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from dataclasses import replace
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -9,9 +11,11 @@ import time
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk, GLib
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
 
 from recorder import RecordingOptions
+from preferences import load_preferences, save_preferences
 from engine.recording import RecordingEngine
 from engine.lifecycle import RecordingLifecycle
 from engine.notifications import DesktopNotifier
@@ -82,11 +86,13 @@ class ScreenRecorder(Gtk.Window):
         self._monitor_pending = False
         self._monitor_generation = 0
         self.recording_status = ''
+        self.preferences = load_preferences()
 
         self.set_default_size(420, 460)
         self.set_border_width(18)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("delete-event", self.on_close)
+        self.set_titlebar(self.create_header_bar())
 
         main = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
@@ -114,8 +120,9 @@ class ScreenRecorder(Gtk.Window):
                 ("mic", "Microphone"),
                 ("both", "System + microphone"),
             ],
-            default="both",
+            default=self.preferences.audio,
             columns=2,
+            preference_key='audio',
         )
 
         settings = Gtk.Box(
@@ -133,8 +140,9 @@ class ScreenRecorder(Gtk.Window):
                 ("30", "30 FPS"),
                 ("60", "60 FPS"),
             ],
-            default="30",
+            default=str(self.preferences.fps),
             columns=1,
+            preference_key='fps',
         )
 
         self.quality = self.create_radio_group(
@@ -143,8 +151,9 @@ class ScreenRecorder(Gtk.Window):
                 ("normal", "Normal"),
                 ("high", "High"),
             ],
-            default="high",
+            default=self.preferences.quality,
             columns=1,
+            preference_key='quality',
         )
 
         output_section = self.create_section(main, "Save to")
@@ -205,6 +214,23 @@ class ScreenRecorder(Gtk.Window):
             self.check_recording_status,
         )
 
+    def create_header_bar(self):
+        header = Gtk.HeaderBar()
+        header.set_title('Screen Recorder')
+        header.set_show_close_button(True)
+        header.set_decoration_layout(':minimize,close')
+        icon_path = Path(__file__).resolve().parent / 'assets/screen-recorder-icon.png'
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                str(icon_path), 28, 28, True,
+            )
+        except (GLib.Error, OSError):
+            # Branding is optional; native window controls remain available.
+            pass
+        else:
+            header.pack_start(Gtk.Image.new_from_pixbuf(pixbuf))
+        return header
+
     def create_label(self, text):
         label = Gtk.Label(label=text)
         label.set_xalign(0)
@@ -221,7 +247,7 @@ class ScreenRecorder(Gtk.Window):
         return section
 
     def create_radio_group(
-        self, container, options, default, columns=2
+        self, container, options, default, columns=2, preference_key=None
     ):
         buttons = {}
         first = None
@@ -254,7 +280,30 @@ class ScreenRecorder(Gtk.Window):
             if value == default:
                 button.set_active(True)
 
+        # GTK activates the first radio implicitly. Connect only after the
+        # whole group and its restored selection exist, including on rebuilds.
+        if preference_key is not None:
+            for value, button in buttons.items():
+                button.connect('toggled', self.on_preference_toggled,
+                               preference_key, value)
+                if preference_key == 'source':
+                    button.connect('clicked', self.on_source_clicked, value)
+
         return buttons
+
+    def on_preference_toggled(self, button, key, value):
+        if not button.get_active():
+            return
+        if key == 'fps':
+            value = int(value)
+        self.preferences = replace(self.preferences, **{key: value})
+        save_preferences(self.preferences)
+
+    def on_source_clicked(self, button, value):
+        # Clicking an already-active region fallback emits no toggled signal.
+        # A normal selection was already saved by toggled; do not save twice.
+        if button.get_active() and self.preferences.source != value:
+            self.on_preference_toggled(button, 'source', value)
 
     def on_button_enter(self, widget, event):
         window = widget.get_window()
@@ -287,7 +336,18 @@ class ScreenRecorder(Gtk.Window):
         if monitors is None:
             monitors = self.monitors
 
-        selected = self.get_selected(self.source) or "region"
+        # The visible fallback is not the user's preference: retain an absent
+        # connector through startup detection, unplugging and other changes.
+        preferences = getattr(self, 'preferences', None)
+        selected = (preferences.source if preferences is not None
+                    else self.get_selected(self.source) or 'region')
+
+        # Retiring a radio group can activate another old member. Disconnect
+        # its selection handlers before removal so teardown cannot save.
+        if preferences is not None:
+            for button in self.source.values():
+                button.disconnect_by_func(self.on_preference_toggled)
+                button.disconnect_by_func(self.on_source_clicked)
 
         for child in self.source_container.get_children():
             self.source_container.remove(child)
@@ -310,6 +370,7 @@ class ScreenRecorder(Gtk.Window):
             options,
             default=selected,
             columns=2,
+            preference_key='source' if preferences is not None else None,
         )
 
         self.source_container.set_sensitive(self.lifecycle.state == 'idle')

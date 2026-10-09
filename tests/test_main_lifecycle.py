@@ -17,14 +17,17 @@ class InertApplication:
         self.quit = Mock()
 
 
-def load_main():
+def load_main(gtk=None, pixbuf=None):
     gi = ModuleType('gi')
     gi.require_version = Mock()
     repository = ModuleType('gi.repository')
-    repository.Gtk = SimpleNamespace(Window=object, Application=InertApplication,
-                                     main_quit=Mock())
+    repository.Gtk = gtk or SimpleNamespace(Window=object, Application=InertApplication,
+                                            main_quit=Mock())
     repository.Gdk = SimpleNamespace()
-    repository.GLib = SimpleNamespace(idle_add=Mock(), timeout_add_seconds=Mock())
+    repository.GLib = SimpleNamespace(idle_add=Mock(), timeout_add_seconds=Mock(),
+                                      Error=RuntimeError)
+    repository.GdkPixbuf = pixbuf or SimpleNamespace(
+        Pixbuf=SimpleNamespace(new_from_file_at_scale=Mock()))
     spec = importlib.util.spec_from_file_location('tested_main', 'main.py')
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {'gi': gi, 'gi.repository': repository}):
@@ -260,6 +263,283 @@ class MainTests(unittest.TestCase):
         with patch.object(self.module.subprocess, 'run', return_value=result):
             monitors = self.module.get_connected_monitors()
         self.assertEqual((monitors[0]['x'], monitors[0]['y']), (-100, 20))
+
+
+class InertWidget:
+    """Enough container behavior for construction without a GTK display."""
+    def __init__(self, **kwargs):
+        self.children = []
+
+    def __getattr__(self, name):
+        method = Mock()
+        setattr(self, name, method)
+        return method
+
+    def pack_start(self, child, *args):
+        self.children.append(child)
+
+    def get_children(self):
+        return list(self.children)
+
+    def remove(self, child):
+        self.children.remove(child)
+
+
+class InertRadio(InertWidget):
+    def __init__(self, first=None):
+        super().__init__()
+        self.group = first.group if first is not None else []
+        self.active = first is None  # GTK implicitly activates the first button.
+        self.handlers = []
+        self.group.append(self)
+
+    @classmethod
+    def new_with_label(cls, first, text):
+        return cls(first)
+
+    new_with_label_from_widget = new_with_label
+
+    def connect(self, signal, callback, *args):
+        assert signal in ('toggled', 'clicked')
+        self.handlers.append((signal, callback, args))
+
+    def disconnect_by_func(self, callback):
+        self.handlers = [(signal, handler, args)
+                         for signal, handler, args in self.handlers
+                         if handler != callback]
+
+    def get_active(self):
+        return self.active
+
+    def emit_toggled(self):
+        for signal, callback, args in self.handlers:
+            if signal == 'toggled':
+                callback(self, *args)
+
+    def emit_clicked(self):
+        for signal, callback, args in self.handlers:
+            if signal == 'clicked':
+                callback(self, *args)
+
+    def clicked(self):
+        self.set_active(True)
+        self.emit_clicked()
+
+    def set_active(self, active):
+        if self.active == active:
+            return
+        if active:
+            for button in self.group:
+                if button.active:
+                    button.active = False
+                    button.emit_toggled()
+        self.active = active
+        self.emit_toggled()
+
+
+def construction_gtk():
+    return SimpleNamespace(
+        Window=InertWidget, Application=InertApplication,
+        Box=InertWidget, Grid=InertWidget, Label=InertWidget,
+        Button=InertWidget, Separator=InertWidget, RadioButton=InertRadio,
+        HeaderBar=InertWidget,
+        Image=SimpleNamespace(new_from_pixbuf=Mock(return_value=InertWidget())),
+        Orientation=SimpleNamespace(VERTICAL=0, HORIZONTAL=1),
+        WindowPosition=SimpleNamespace(CENTER=0),
+    )
+
+
+class MainPreferencesTests(unittest.TestCase):
+    def setUp(self):
+        from preferences import Preferences
+        self.Preferences = Preferences
+        self.pixbuf_loader = Mock()
+        self.module = load_main(construction_gtk(), SimpleNamespace(
+            Pixbuf=SimpleNamespace(new_from_file_at_scale=self.pixbuf_loader)))
+        self.module.Gdk.EventMask = SimpleNamespace(ENTER_NOTIFY_MASK=1,
+                                                    LEAVE_NOTIFY_MASK=2)
+        self.module.GLib.markup_escape_text = lambda text: text
+        self.saved = Preferences(source='DP-1', audio='mic', fps=60, quality='normal')
+        self.load = patch.object(self.module, 'load_preferences',
+                                 return_value=self.saved, create=True)
+        self.save = patch.object(self.module, 'save_preferences',
+                                 return_value=True, create=True)
+        self.loader = self.load.start()
+        self.saver = self.save.start()
+        self.addCleanup(self.load.stop)
+        self.addCleanup(self.save.stop)
+        # Construction cannot create an engine/notifier with device side effects.
+        self.engine = patch.object(self.module, 'RecordingEngine')
+        self.notifier = patch.object(self.module, 'DesktopNotifier')
+        self.engine.start()
+        self.notifier.start()
+        self.addCleanup(self.engine.stop)
+        self.addCleanup(self.notifier.stop)
+        self.ui = self.module.ScreenRecorder()
+
+    def monitors(self):
+        return [{'id': 'DP-1', 'label': 'DisplayPort'}]
+
+    def test_constructor_installs_native_header_with_scaled_left_icon(self):
+        self.ui.set_titlebar.assert_called_once()
+        header = self.ui.set_titlebar.call_args.args[0]
+        header.set_title.assert_called_once_with('Screen Recorder')
+        header.set_show_close_button.assert_called_once_with(True)
+        header.set_decoration_layout.assert_called_once_with(':minimize,close')
+        expected_path = Path(self.module.__file__).resolve().parent / 'assets/screen-recorder-icon.png'
+        self.pixbuf_loader.assert_called_once_with(str(expected_path), 28, 28, True)
+        self.module.Gtk.Image.new_from_pixbuf.assert_called_once_with(
+            self.pixbuf_loader.return_value)
+        self.assertEqual(header.get_children(),
+                         [self.module.Gtk.Image.new_from_pixbuf.return_value])
+        self.ui.connect.assert_called_once_with('delete-event', self.ui.on_close)
+        self.saver.assert_not_called()
+
+    def test_header_icon_is_resolved_from_module_not_working_directory(self):
+        self.pixbuf_loader.reset_mock()
+        with patch.object(self.module, '__file__', '/opt/screen-recorder/main.py'):
+            self.ui.create_header_bar()
+        self.pixbuf_loader.assert_called_once_with(
+            '/opt/screen-recorder/assets/screen-recorder-icon.png', 28, 28, True)
+
+    def test_missing_or_corrupt_header_icon_does_not_block_startup(self):
+        for error in (self.module.GLib.Error('missing icon'),
+                      self.module.GLib.Error('corrupt icon'), OSError('unreadable')):
+            with self.subTest(error=error):
+                self.pixbuf_loader.side_effect = error
+                ui = self.module.ScreenRecorder()
+                ui.set_titlebar.assert_called_once()
+                header = ui.set_titlebar.call_args.args[0]
+                header.set_title.assert_called_once_with('Screen Recorder')
+                header.set_show_close_button.assert_called_once_with(True)
+                header.set_decoration_layout.assert_called_once_with(':minimize,close')
+                self.assertEqual(header.get_children(), [])
+                self.assertEqual(ui.get_selected(ui.audio), 'mic')
+                ui.connect.assert_called_once_with('delete-event', ui.on_close)
+        self.saver.assert_not_called()
+
+    def test_constructor_restores_static_values_without_saving_implicit_activation(self):
+        self.loader.assert_called_once_with()
+        self.assertEqual(self.ui.get_selected(self.ui.audio), 'mic')
+        self.assertEqual(self.ui.get_selected(self.ui.fps), '60')
+        self.assertEqual(self.ui.get_selected(self.ui.quality), 'normal')
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'region')
+        self.saver.assert_not_called()
+
+    def test_default_constructor_keeps_existing_defaults_without_saving(self):
+        self.loader.return_value = self.Preferences()
+        ui = self.module.ScreenRecorder()
+        for group, expected in ((ui.source, 'region'), (ui.audio, 'both'),
+                                (ui.fps, '30'), (ui.quality, 'high')):
+            self.assertEqual(ui.get_selected(group), expected)
+        self.saver.assert_not_called()
+
+    def test_async_initial_detection_restores_connector_without_saving(self):
+        self.ui._monitor_pending = True
+        self.ui._monitor_generation = 1
+        self.ui.finish_monitor_refresh(1, self.monitors(), self.ui.lifecycle.token)
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'DP-1')
+        self.assertFalse(self.ui._monitor_pending)
+        self.saver.assert_not_called()
+
+    def test_disconnected_source_survives_other_changes_and_reconnect(self):
+        self.ui.refresh_monitors(self.monitors())
+        self.ui.refresh_monitors([])
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'region')
+        self.ui.audio['none'].set_active(True)
+        self.saver.assert_called_once_with(
+            self.Preferences(source='DP-1', audio='none', fps=60, quality='normal'))
+        self.ui.refresh_monitors(self.monitors())
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'DP-1')
+        self.assertEqual(self.saver.call_count, 1)
+
+    def test_change_before_initial_detection_keeps_preferred_connector(self):
+        self.ui.audio['system'].set_active(True)
+        self.saver.assert_called_once_with(
+            self.Preferences(source='DP-1', audio='system', fps=60, quality='normal'))
+        self.ui.finish_monitor_refresh(0, self.monitors(), self.ui.lifecycle.token)
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'DP-1')
+        self.assertEqual(self.saver.call_count, 1)
+
+    def test_click_already_active_fallback_replaces_preference_and_stays_region(self):
+        region = self.ui.source['region']
+        self.assertTrue(region.get_active())
+        region.clicked()
+        self.saver.assert_called_once_with(
+            self.Preferences(audio='mic', fps=60, quality='normal'))
+        region.clicked()
+        self.assertEqual(self.saver.call_count, 1)
+        self.ui.refresh_monitors(self.monitors())
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'region')
+        self.assertEqual(self.saver.call_count, 1)
+
+    def test_source_click_saves_once_and_inactive_click_signal_is_ignored(self):
+        self.ui.refresh_monitors(self.monitors())
+        self.ui.source['region'].emit_clicked()
+        self.saver.assert_not_called()
+        self.ui.source['region'].clicked()
+        self.saver.assert_called_once_with(
+            self.Preferences(audio='mic', fps=60, quality='normal'))
+        self.ui.source['DP-1'].clicked()
+        self.assertEqual(self.saver.call_count, 2)
+        self.assertEqual(self.saver.call_args.args[0].source, 'DP-1')
+
+    def test_retired_fallback_click_cannot_change_preferences(self):
+        old_region = self.ui.source['region']
+        self.ui.refresh_monitors(self.monitors())
+        old_region.clicked()
+        self.saver.assert_not_called()
+        self.ui.audio['none'].set_active(True)
+        self.assertEqual(self.saver.call_args.args[0].source, 'DP-1')
+
+    def test_explicit_source_selection_replaces_preference(self):
+        self.ui.refresh_monitors(self.monitors())
+        self.ui.source['region'].set_active(True)
+        self.saver.assert_called_once_with(
+            self.Preferences(audio='mic', fps=60, quality='normal'))
+        self.ui.refresh_monitors([])
+        self.ui.refresh_monitors(self.monitors())
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'region')
+        self.ui.source['DP-1'].set_active(True)
+        self.assertEqual(self.saver.call_count, 2)
+        self.assertEqual(self.saver.call_args.args[0].source, 'DP-1')
+
+    def test_each_active_selection_saves_immediately_and_inactive_is_ignored(self):
+        self.ui.audio['mic'].set_active(False)
+        self.saver.assert_not_called()
+        self.ui.audio['system'].set_active(True)
+        self.ui.fps['30'].set_active(True)
+        self.ui.quality['high'].set_active(True)
+        self.assertEqual(self.saver.call_count, 3)
+        self.assertEqual(self.saver.call_args.args[0],
+                         self.Preferences(source='DP-1', audio='system', fps=30))
+        self.assertIs(type(self.saver.call_args.args[0].fps), int)
+
+    def test_rebuild_ignores_old_group_activation_during_teardown(self):
+        self.ui.refresh_monitors(self.monitors())
+        old_region = self.ui.source['region']
+        remove = self.ui.source_container.remove
+
+        def teardown(child):
+            # GTK can change an old radio group's active member on destruction.
+            old_region.set_active(True)
+            remove(child)
+
+        with patch.object(self.ui.source_container, 'remove', side_effect=teardown):
+            self.ui.refresh_monitors([])
+        self.saver.assert_not_called()
+        self.ui.audio['none'].set_active(True)
+        self.assertEqual(self.saver.call_args.args[0].source, 'DP-1')
+
+    def test_rebuilds_never_save_and_failure_does_not_block_next_change(self):
+        for monitors in (self.monitors(), [], self.monitors()):
+            self.ui.refresh_monitors(monitors)
+        self.saver.assert_not_called()
+        self.saver.return_value = False
+        self.ui.audio['none'].set_active(True)
+        self.assertEqual(self.ui.get_selected(self.ui.audio), 'none')
+        self.ui.quality['high'].set_active(True)
+        self.assertEqual(self.saver.call_count, 2)
 
 
 class ApplicationTests(unittest.TestCase):
