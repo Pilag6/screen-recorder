@@ -2,9 +2,8 @@
 
 import re
 import subprocess
-import sys
 import threading
-from pathlib import Path
+import time
 
 import gi
 
@@ -13,6 +12,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 from recorder import RecordingOptions
 from engine.recording import RecordingEngine
+from engine.lifecycle import RecordingLifecycle
 
 
 MONITOR_NAMES = {
@@ -20,11 +20,6 @@ MONITOR_NAMES = {
     "DVI-I-3-2": "LG derecha",
     "DVI-I-2-1": "Samsung arriba",
 }
-
-BORDER_SCRIPT = (
-    Path.home() / ".local/bin/recording-border.py"
-)
-
 
 def get_connected_monitors():
     try:
@@ -49,7 +44,7 @@ def get_connected_monitors():
 
         match = re.fullmatch(
             r"(\d+)(?:/\d+)?x(\d+)(?:/\d+)?"
-            r"\+(\d+)\+(\d+)",
+            r"([+-]\d+)([+-]\d+)",
             parts[2],
         )
 
@@ -76,9 +71,12 @@ class ScreenRecorder(Gtk.Window):
         super().__init__(title="Screen Recorder")
 
         self.engine = RecordingEngine()
-        self.recording = False
-        self.selecting = False
-        self.border_process = None
+        self.lifecycle = RecordingLifecycle(
+            self.engine, GLib.idle_add, self.on_lifecycle_state,
+        )
+        self._monitor_pending = False
+        self._monitor_generation = 0
+        self.recording_status = ''
 
         self.set_default_size(440, 420)
         self.set_border_width(24)
@@ -230,6 +228,7 @@ class ScreenRecorder(Gtk.Window):
 
         self.update_button()
 
+        GLib.idle_add(self.check_monitor_changes)
         GLib.timeout_add_seconds(
             3,
             self.check_monitor_changes,
@@ -310,7 +309,7 @@ class ScreenRecorder(Gtk.Window):
 
     def refresh_monitors(self, monitors=None):
         if monitors is None:
-            monitors = get_connected_monitors()
+            monitors = self.monitors
 
         selected = self.get_selected(self.source) or "region"
 
@@ -337,67 +336,80 @@ class ScreenRecorder(Gtk.Window):
             columns=2,
         )
 
-        self.source_container.set_sensitive(
-            not self.recording and not self.selecting
-        )
+        self.source_container.set_sensitive(self.lifecycle.state == 'idle')
 
         self.source_container.show_all()
         self.monitors = monitors
 
     def check_monitor_changes(self):
-        if not self.recording and not self.selecting:
+        if self.lifecycle.closed:
+            return False
+        if self.lifecycle.state != 'idle' or self._monitor_pending:
+            return True
+        self._monitor_pending = True
+        self._monitor_generation += 1
+        generation = self._monitor_generation
+        token = self.lifecycle.token
+
+        def worker():
             monitors = get_connected_monitors()
+            GLib.idle_add(self.finish_monitor_refresh, generation, monitors, token)
 
-            if monitors != self.monitors:
-                self.refresh_monitors(monitors)
-
+        # subprocess.run has a 5s timeout and reaps xrandr. A non-daemon
+        # refresh worker cannot be abandoned during interpreter shutdown.
+        threading.Thread(target=worker).start()
         return True
 
+    def finish_monitor_refresh(self, generation, monitors, token=None):
+        if generation != self._monitor_generation:
+            return False
+        self._monitor_pending = False
+        if (not self.lifecycle.closed and self.lifecycle.state == 'idle'
+                and (token is None or self.lifecycle.token == token)
+                and monitors != self.monitors):
+            self.refresh_monitors(monitors)
+        return False
+
     def check_recording_status(self):
-        if self.recording and not self.engine.is_recording():
-            self.recording = False
-            self.stop_border()
-
+        if self.lifecycle.closed:
+            return False
+        if self.lifecycle.state == 'recording' and self.lifecycle.started_at is not None:
+            elapsed = max(0, int(time.monotonic() - self.lifecycle.started_at))
+            hours, remainder = divmod(elapsed, 3600)
+            minutes, seconds = divmod(remainder, 60)
             self.status.set_text(
-                "Recording process ended unexpectedly"
+                f'REC {hours:02}:{minutes:02}:{seconds:02} — {self.recording_status}'
             )
-            self.update_button()
-
         return True
 
     def set_controls_enabled(self, enabled):
         self.source_container.set_sensitive(enabled)
-
-        for group in (
-            self.audio,
-            self.fps,
-            self.quality,
-        ):
+        for group in (self.audio, self.fps, self.quality):
             for button in group.values():
                 button.set_sensitive(enabled)
 
     def update_button(self):
+        state = self.lifecycle.state
         style = self.start_button.get_style_context()
-
-        if self.recording:
-            self.start_button.set_label("Stop Recording")
-            style.remove_class("suggested-action")
-            style.add_class("destructive-action")
-        else:
-            self.start_button.set_label("Start Recording")
-            style.remove_class("destructive-action")
-            style.add_class("suggested-action")
-
-        self.start_button.set_sensitive(not self.selecting)
-        self.set_controls_enabled(
-            not self.recording and not self.selecting
-        )
+        active = state != 'idle'
+        labels = {
+            'idle': 'Start Recording',
+            'recording': 'Stop Recording',
+            'stopping': 'Please wait...',
+            'closed': 'Closing...',
+            'cleanup_failed': 'Retry cleanup',
+        }
+        self.start_button.set_label(labels.get(state, 'Cancel Recording'))
+        style.remove_class('suggested-action' if active else 'destructive-action')
+        style.add_class('destructive-action' if active else 'suggested-action')
+        self.start_button.set_sensitive(state not in ('stopping', 'closed'))
+        self.set_controls_enabled(not active)
 
     def on_record_clicked(self, button):
-        if self.recording:
-            self.stop_recording()
-        elif not self.selecting:
+        if self.lifecycle.state == 'idle':
             self.start_recording()
+        else:
+            self.lifecycle.cancel()
 
     def get_options(self):
         options = RecordingOptions(
@@ -406,189 +418,46 @@ class ScreenRecorder(Gtk.Window):
             fps=int(self.get_selected(self.fps)),
             quality=self.get_selected(self.quality),
         )
-
         options.validate()
         return options
 
     def start_recording(self):
         try:
-            options = self.get_options()
-
-            if options.source == "region":
-                self.begin_region_selection(options)
-            else:
-                self.launch_recording(
-                    options,
-                    monitor=options.source,
-                )
-
+            self.lifecycle.begin(self.get_options())
         except Exception as error:
-            self.show_message(
-                "Recording error",
-                str(error),
-                Gtk.MessageType.ERROR,
-            )
+            self.status.set_text(f'Recording error: {error}')
 
-    def begin_region_selection(self, options):
-        self.selecting = True
-        self.status.set_text("Select a screen region...")
-        self.update_button()
-
-        self.hide()
-
-        GLib.timeout_add(
-            300,
-            self.run_region_selection,
-            options,
-        )
-
-    def run_region_selection(self, options):
-        def worker():
-            try:
-                region = self.engine.select_region()
-                error = None
-            except Exception as exc:
-                region = None
-                error = str(exc)
-
-            GLib.idle_add(
-                self.finish_region_selection,
-                options,
-                region,
-                error,
-            )
-
-        threading.Thread(
-            target=worker,
-            daemon=True,
-        ).start()
-
-        return False
-
-    def finish_region_selection(
-        self, options, region, error
-    ):
-        self.selecting = False
-        self.show_all()
-
-        if error:
-            self.status.set_text("Region selection failed")
-            self.show_message(
-                "Region error",
-                error,
-                Gtk.MessageType.ERROR,
-            )
-        elif region is None:
-            self.status.set_text("Region selection cancelled")
+    def on_lifecycle_state(self, state, message, output=None):
+        if state == 'closed':
+            if 'error' in message.lower():
+                print(message)
+            Gtk.main_quit()
+            return
+        if self.lifecycle.closed and state not in ('cleanup_failed', 'stopping'):
+            return
+        if state == 'selecting' or (self.lifecycle.closed and state == 'stopping'):
+            self.hide()
         else:
-            self.launch_recording(
-                options,
-                region=region,
-            )
-
+            self.show_all()
+        self.status.set_text(message)
+        self.recording_status = message
+        if state == 'recording':
+            self.status.set_tooltip_text(self.lifecycle.indicator_reason)
+            print(self.lifecycle.indicator_reason)
+            print(f'Recording started: {output}')
+            self.check_recording_status()
+        else:
+            self.status.set_tooltip_text(None)
         self.update_button()
-        return False
-
-    def start_border(self, region):
-        if not BORDER_SCRIPT.is_file():
-            print("Recording border script not found")
-            return
-
-        self.stop_border()
-
-        self.border_process = subprocess.Popen(
-            [
-                sys.executable,
-                str(BORDER_SCRIPT),
-                *[str(value) for value in region],
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    def stop_border(self):
-        if self.border_process is None:
-            return
-
-        if self.border_process.poll() is None:
-            self.border_process.terminate()
-
-        self.border_process = None
-
-    def launch_recording(
-        self, options, monitor=None, region=None
-    ):
-        try:
-            output = self.engine.start(
-                monitor=monitor,
-                region=region,
-                fps=options.fps,
-                quality=options.quality,
-                audio=options.audio,
-            )
-
-            self.recording = True
-
-            if region is not None:
-                try:
-                    self.start_border(region)
-                except OSError as error:
-                    print(f"Could not show border: {error}")
-
-            self.status.set_text(
-                f"Recording... Audio: {options.audio}"
-            )
-            self.update_button()
-
-            print(f"Recording started: {output}")
-
-        except Exception as error:
-            self.stop_border()
-            self.recording = self.engine.is_recording()
-            self.update_button()
-
-            self.show_message(
-                "Recording error",
-                str(error),
-                Gtk.MessageType.ERROR,
-            )
 
     def stop_recording(self):
-        self.start_button.set_sensitive(False)
-        self.status.set_text("Saving recording...")
-
-        try:
-            output = self.engine.stop()
-
-            self.status.set_text(
-                f"Saved: {output.name}"
-                if output else "Recording stopped"
-            )
-
-        except Exception as error:
-            self.show_message(
-                "Stop error",
-                str(error),
-                Gtk.MessageType.ERROR,
-            )
-
-        finally:
-            self.stop_border()
-            self.recording = self.engine.is_recording()
-            self.start_button.set_sensitive(True)
-            self.update_button()
+        self.lifecycle.cancel()
 
     def on_close(self, widget, event):
-        if self.engine.is_recording():
-            try:
-                self.engine.stop()
-            except Exception as error:
-                print(f"Stop error: {error}")
-
-        self.stop_border()
-        Gtk.main_quit()
-
-        return False
+        # Keep the GTK loop alive while the session worker cleans up. No waits here.
+        self.hide()
+        self.lifecycle.close()
+        return True
 
     def show_message(self, title, message, message_type):
         dialog = Gtk.MessageDialog(

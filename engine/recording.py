@@ -4,6 +4,9 @@ import os
 import re
 import signal
 import subprocess
+import uuid
+
+from engine.lifecycle import OwnedProcesses, check_cancel
 from datetime import datetime
 from pathlib import Path
 
@@ -23,10 +26,23 @@ VALID_AUDIO = {
 }
 
 
+def normalize_geometry(geometry):
+    """One capture rectangle for FFmpeg, border, and indicator policy."""
+    if len(geometry) != 4 or any(type(value) is not int for value in geometry):
+        raise ValueError("Invalid capture geometry")
+    x, y, width, height = geometry
+    width = width // 2 * 2
+    height = height // 2 * 2
+    if width < 2 or height < 2:
+        raise ValueError("Region is too small")
+    return x, y, width, height
+
+
 class RecordingEngine:
     def __init__(self):
         self.process = None
         self.output_file = None
+        self.owner = None
 
     def get_monitor_geometry(self, monitor_name):
         result = subprocess.run(
@@ -45,7 +61,7 @@ class RecordingEngine:
 
             match = re.fullmatch(
                 r"(\d+)(?:/\d+)?x(\d+)(?:/\d+)?"
-                r"\+(\d+)\+(\d+)",
+                r"([+-]\d+)([+-]\d+)",
                 parts[2],
             )
 
@@ -60,27 +76,34 @@ class RecordingEngine:
             f"Monitor not found: {monitor_name}"
         )
 
-    def select_region(self):
-        result = subprocess.run(
-            ["slop", "-f", "%x %y %w %h"],
-            capture_output=True,
-            text=True,
+    def select_region(self, cancel=None, owner=None):
+        own_registry = owner is None
+        owner = owner if owner is not None else OwnedProcesses()
+        check_cancel(cancel)
+        child = owner.spawn(
+            'selection', ["slop", "-f", "%x %y %w %h"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-
-        if result.returncode != 0:
-            return None
-
-        values = result.stdout.strip().split()
-
-        if len(values) != 4:
-            raise ValueError("Invalid region selection")
-
-        x, y, width, height = map(int, values)
-
-        if width < 2 or height < 2:
-            raise ValueError("Region is too small")
-
-        return x, y, width, height
+        try:
+            while True:
+                check_cancel(cancel)
+                try:
+                    stdout, _ = child.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            code = child.returncode
+            owner.reap('selection')
+            check_cancel(cancel)
+            if code != 0:
+                return None
+            values = stdout.strip().split()
+            if len(values) != 4:
+                raise ValueError("Invalid region selection")
+            return normalize_geometry(tuple(map(int, values)))
+        finally:
+            if own_registry:
+                owner.cleanup()
 
     def get_default_audio_devices(self):
         sink = subprocess.run(
@@ -156,9 +179,18 @@ class RecordingEngine:
         fps=30,
         quality="high",
         audio="none",
+        cancel=None,
+        owner=None,
     ):
+        check_cancel(cancel)
         if self.is_recording():
             raise RuntimeError("Already recording")
+        if self.process is not None:
+            if self.owner is not None and 'ffmpeg' not in self.owner.children:
+                self.process = None  # Session cleanup already reaped it.
+                self.owner = None
+            else:
+                self.stop()
 
         if fps not in (30, 60):
             raise ValueError("Invalid frame rate")
@@ -178,22 +210,18 @@ class RecordingEngine:
         else:
             raise ValueError("No recording source selected")
 
-        width = width // 2 * 2
-        height = height // 2 * 2
-
-        if width < 2 or height < 2:
-            raise ValueError("Region is too small")
-
+        x, y, width, height = normalize_geometry((x, y, width, height))
+        check_cancel(cancel)
         audio_args = self.build_audio_arguments(audio)
+        check_cancel(cancel)
 
         OUTPUT_DIR.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        filename = datetime.now().strftime(
-            "Recording-%Y-%m-%d_%H-%M-%S.mkv"
-        )
+        filename = datetime.now().strftime("Recording-%Y-%m-%d_%H-%M-%S")
+        filename += f'-{uuid.uuid4().hex[:8]}.mkv'  # Never overwrite a rapid restart.
 
         self.output_file = OUTPUT_DIR / filename
 
@@ -213,29 +241,26 @@ class RecordingEngine:
             str(self.output_file),
         ]
 
-        self.process = subprocess.Popen(command)
-
+        check_cancel(cancel)
+        self.owner = owner if owner is not None else OwnedProcesses()
+        self.process = self.owner.spawn('ffmpeg', command)
         return self.output_file
 
     def stop(self):
-        if not self.is_recording():
+        if self.process is None:
             return None
-
-        self.process.send_signal(signal.SIGINT)
-
-        try:
-            self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
-
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-
+        owner = self.owner if self.owner is not None else OwnedProcesses()
+        if 'ffmpeg' not in owner.children:
+            owner.add('ffmpeg', self.process)
+        code = owner.reap('ffmpeg', signal.SIGINT)
         self.process = None
-
+        self.owner = None
+        if code not in (0, 255) or 'ffmpeg' in owner.escalated:
+            raise RuntimeError(f'FFmpeg exited ({code}) or required forced shutdown; '
+                               f'output may be incomplete: {self.output_file}')
+        if (self.output_file is None or not self.output_file.is_file()
+                or self.output_file.stat().st_size == 0):
+            raise RuntimeError('FFmpeg did not save a nonempty recording')
         return self.output_file
 
     def is_recording(self):

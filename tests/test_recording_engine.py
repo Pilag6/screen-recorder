@@ -75,10 +75,31 @@ class EngineTests(unittest.TestCase):
         engine.process.poll.return_value = 1
         process = engine.process
         engine.output_file = Path('file.mkv')
-        self.assertEqual(engine.stop(), Path('file.mkv'))
+        process.wait.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, 'FFmpeg'):
+            engine.stop()
         process.wait.assert_called_once()
         process.send_signal.assert_not_called()
         self.assertIsNone(engine.process)
+
+    def test_saved_requires_successful_exit_and_nonempty_file(self):
+        for code, exists, size, saved in ((0, True, 123, True), (255, True, 123, True),
+                                          (1, True, 123, False), (0, False, 0, False),
+                                          (0, True, 0, False)):
+            with self.subTest(code=code, exists=exists, size=size):
+                engine = RecordingEngine()
+                engine.process = Mock(stdout=None, stderr=None)
+                engine.process.poll.return_value = code
+                engine.process.wait.return_value = code
+                engine.output_file = Path('file.mkv')
+                with patch('pathlib.Path.is_file', return_value=exists), \
+                     patch('pathlib.Path.stat', return_value=Mock(st_size=size)):
+                    if saved:
+                        self.assertEqual(engine.stop(), Path('file.mkv'))
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            engine.stop()
+                self.assertIsNone(engine.process)
 
     def test_selection_cancellation_owns_and_reaps_slop(self):
         engine = RecordingEngine()

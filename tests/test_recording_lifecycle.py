@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from engine.lifecycle import OwnedProcesses, RecordingLifecycle
+from engine.indicator_launcher import IndicatorPlan
 from recorder import RecordingOptions
 
 
@@ -53,6 +54,11 @@ class LifecycleTests(unittest.TestCase):
         self.engine.stop.return_value = Path('recording.mkv')
         self.countdown = Child(0)
         self.border = Child()
+        self.indicator = Child()
+        self.plan = patch('engine.lifecycle.indicator_plan', return_value=IndicatorPlan(
+            ('python', 'safe-indicator', '0', '0', '100', '98'), 'Measured REC'))
+        self.plan_mock = self.plan.start()
+        self.addCleanup(self.plan.stop)
         self.options = RecordingOptions('monitor', 'both', 60, 'normal')
         self.life = RecordingLifecycle(
             self.engine, self.queue.put, lambda *args: self.states.append(args)
@@ -60,12 +66,14 @@ class LifecycleTests(unittest.TestCase):
         self.exists = patch('pathlib.Path.is_file', return_value=True)
         self.exists.start()
         self.spawn = patch('engine.lifecycle.subprocess.Popen', side_effect=self.popen)
-        self.spawn.start()
+        self.spawn_mock = self.spawn.start()
         self.addCleanup(self.exists.stop)
         self.addCleanup(self.spawn.stop)
         self.addCleanup(self.cleanup)
 
     def popen(self, command, **kwargs):
+        if 'safe-indicator' in command:
+            return self.indicator
         return self.border if 'recording-border.py' in str(command) else self.countdown
 
     def cleanup(self):
@@ -123,7 +131,7 @@ class LifecycleTests(unittest.TestCase):
         self.next_callback()  # recording
         self.assertEqual(self.life.state, 'recording')
         self.assertEqual(self.engine.start.call_args.kwargs['region'], (10, 20, 100, 98))
-        commands = [call.args[0] for call in self.spawn.mock_calls if call.args]
+        commands = [call.args[0] for call in self.spawn_mock.mock_calls if call.args]
         self.assertTrue(any(c[-4:] == ['10', '20', '100', '98'] for c in commands))
         self.life.cancel()
         self.finish()
@@ -156,6 +164,182 @@ class LifecycleTests(unittest.TestCase):
         self.engine.stop.assert_called_once()
         self.assertIn('unexpectedly', self.states[-1][1])
         self.assertEqual(self.life.state, 'idle')
+
+    def test_early_ffmpeg_exit_never_shows_rec_or_border(self):
+        self.engine.is_recording.return_value = False
+        self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+        self.authorize()
+        self.finish()
+        self.assertFalse(any('safe-indicator' in call.args[0] or
+                             'recording-border.py' in str(call.args[0])
+                             for call in self.spawn_mock.call_args_list))
+        self.assertNotIn('recording', [state[0] for state in self.states])
+        self.assertIn('unexpectedly', self.states[-1][1])
+
+    def test_indicator_spawned_owned_and_reaped_on_stop(self):
+        self.life.begin(self.options)
+        self.authorize()
+        self.next_callback()
+        self.assertTrue(any('safe-indicator' in call.args[0]
+                            for call in self.spawn_mock.call_args_list))
+        self.plan_mock.assert_called_once_with((0, 0, 100, 98))
+        self.assertFalse(any('recording-border.py' in str(call.args[0])
+                             for call in self.spawn_mock.call_args_list))
+        self.life.cancel()
+        self.finish()
+        self.assertIn(('terminate',), self.indicator.calls)
+        self.assertIn(('wait', 3), self.indicator.calls)
+
+    def test_indicator_exit_falls_back_without_stopping_recording(self):
+        self.indicator.code = 2
+        self.life.begin(self.options)
+        self.authorize()
+        self.next_callback()
+        self.next_callback()
+        self.assertEqual(self.life.state, 'recording')
+        self.assertIn('in-window', self.life.indicator_reason)
+        self.engine.stop.assert_not_called()
+        self.life.cancel()
+        self.finish()
+        self.assertIn(('wait', 3), self.indicator.calls)
+
+    def test_indicator_and_border_launch_errors_are_optional(self):
+        def popen(command, **kwargs):
+            if 'safe-indicator' in command or 'recording-border.py' in str(command):
+                raise OSError('mock helper unavailable')
+            return self.countdown
+        self.spawn_mock.side_effect = popen
+        self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+        self.authorize()
+        self.next_callback()
+        self.assertEqual(self.life.state, 'recording')
+        self.assertIn('in-window', self.life.indicator_reason)
+        self.assertIn('border', self.states[-1][1].lower())
+        self.life.cancel()
+        self.finish()
+
+    def test_live_countdown_cancel_real_engine_never_creates_output(self):
+        from engine.recording import RecordingEngine
+        self.life.engine = RecordingEngine()
+        self.life.engine.get_monitor_geometry = Mock(return_value=(0, 0, 100, 98))
+        self.countdown.code = None
+        with patch('pathlib.Path.mkdir') as mkdir:
+            self.life.begin(RecordingOptions('monitor', 'none', 30, 'high'))
+            self.next_callback()
+            self.life.cancel()
+            self.finish()
+        mkdir.assert_not_called()
+        self.assertFalse(any(call.args[0][0] == 'ffmpeg' for call in self.spawn_mock.call_args_list))
+        self.assertIn(('terminate',), self.countdown.calls)
+        self.assertIn(('wait', 3), self.countdown.calls)
+
+    def test_close_during_ffmpeg_popen_reaps_child_returned_after_close(self):
+        from engine.recording import RecordingEngine
+        real_engine = RecordingEngine()
+        real_engine.get_monitor_geometry = Mock(return_value=(0, 0, 100, 98))
+        self.life.engine = real_engine
+        entered, release = threading.Event(), threading.Event()
+        ffmpeg = Child()
+        def popen(command, **kwargs):
+            if command[0] == 'ffmpeg':
+                entered.set()
+                release.wait(2)
+                return ffmpeg
+            return self.popen(command, **kwargs)
+        self.spawn_mock.side_effect = popen
+        with patch('pathlib.Path.mkdir'), patch('pathlib.Path.stat', return_value=Mock(st_size=42)):
+            self.life.begin(RecordingOptions('monitor', 'none', 30, 'high'))
+            self.authorize()
+            self.assertTrue(entered.wait(2))
+            self.life.close()
+            self.assertTrue(self.life.worker.is_alive())
+            self.assertNotIn('closed', [state[0] for state in self.states])
+            release.set()
+            self.finish()
+        self.assertIn(('signal', signal.SIGINT), ffmpeg.calls)
+        self.assertTrue(any(call[0] == 'wait' for call in ffmpeg.calls))
+        self.assertIsNone(real_engine.process)
+        self.assertEqual(self.life.state, 'closed')
+
+    def test_close_during_selection_invalidates_result(self):
+        entered, release = threading.Event(), threading.Event()
+        def select(**kwargs):
+            entered.set()
+            release.wait(2)
+            return (0, 0, 100, 98)
+        self.engine.select_region.side_effect = select
+        self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+        self.assertTrue(entered.wait(2))
+        self.life.close()
+        release.set()
+        self.finish()
+        self.spawn_mock.assert_not_called()
+        self.engine.start.assert_not_called()
+        self.assertEqual(self.life.state, 'closed')
+
+    def test_countdown_timeout_or_launch_failure_never_starts(self):
+        self.countdown.code = None
+        with patch('engine.lifecycle.time.monotonic', side_effect=[0, 16]):
+            self.life.begin(self.options)
+            self.finish()
+        self.assertIn('timed out', self.states[-1][1])
+        self.engine.start.assert_not_called()
+        self.spawn_mock.side_effect = OSError('countdown unavailable')
+        self.life.begin(self.options)
+        self.finish()
+        self.assertIn('unavailable', self.states[-1][1])
+        self.engine.start.assert_not_called()
+
+    def test_stale_completion_cannot_replace_new_session(self):
+        self.life.begin(self.options)
+        old_notification = self.queue.get(timeout=2)
+        self.life.cancel()
+        self.life.worker.join(2)
+        callbacks = []
+        while not self.queue.empty():
+            callbacks.append(self.queue.get())
+        for callback in callbacks:
+            callback()
+        self.assertEqual(self.life.state, 'idle')
+        self.life.begin(self.options)
+        current_session = self.life.session
+        for callback in [old_notification, *callbacks]:
+            callback()
+        self.assertIs(self.life.session, current_session)
+        self.assertEqual(self.life.state, 'countdown')
+        self.life.cancel()
+        self.finish()
+
+    def test_unreaped_children_prevent_closed_callback_and_allow_retry(self):
+        child = Child(stubborn=True)
+        child.kill = Mock()  # Even final bounded wait fails; child remains owned.
+        def start(**kwargs):
+            kwargs['owner'].add('ffmpeg', child)
+            return Path('recording.mkv')
+        self.engine.start.side_effect = start
+        self.life.begin(self.options)
+        self.authorize()
+        self.next_callback()
+        self.life.close()
+        self.finish()
+        self.assertEqual(self.life.state, 'cleanup_failed')
+        self.assertNotIn('closed', [state[0] for state in self.states])
+        self.assertIsNotNone(self.life.session)
+        child.code = 0
+        self.life.close()
+        self.finish()
+        self.assertEqual(self.life.state, 'closed')
+        self.assertIsNone(self.life.session)
+
+    def test_save_error_is_not_reported_as_saved(self):
+        self.engine.stop.side_effect = RuntimeError('FFmpeg failed')
+        self.life.begin(self.options)
+        self.authorize()
+        self.next_callback()
+        self.life.cancel()
+        self.finish()
+        self.assertIn('error', self.states[-1][1].lower())
+        self.assertNotIn('Saved:', self.states[-1][1])
 
     def test_double_start_and_restart_while_stopping_are_rejected(self):
         self.life.begin(self.options)
