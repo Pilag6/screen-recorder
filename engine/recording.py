@@ -81,7 +81,7 @@ class RecordingEngine:
         owner = owner if owner is not None else OwnedProcesses()
         check_cancel(cancel)
         child = owner.spawn(
-            'selection', ["slop", "-f", "%x %y %w %h"],
+            'selection', ["slop", "--color=1,0.15,0.15,1", "-f", "%x %y %w %h"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:

@@ -101,6 +101,18 @@ class EngineTests(unittest.TestCase):
                             engine.stop()
                 self.assertIsNone(engine.process)
 
+    def test_selection_uses_red_outline_and_normalized_geometry(self):
+        child = Mock(stdout=None, stderr=None, returncode=0)
+        child.communicate.return_value = ('-12 20 101 99', '')
+        child.poll.return_value = 0
+        child.wait.return_value = 0
+        with patch('engine.lifecycle.subprocess.Popen', return_value=child) as spawn:
+            geometry = RecordingEngine().select_region()
+        self.assertEqual(spawn.call_args.args[0],
+                         ['slop', '--color=1,0.15,0.15,1', '-f', '%x %y %w %h'])
+        self.assertEqual(geometry, (-12, 20, 100, 98))
+        child.wait.assert_called_once()
+
     def test_selection_cancellation_owns_and_reaps_slop(self):
         engine = RecordingEngine()
         owner = OwnedProcesses()

@@ -240,6 +240,14 @@ class RecordingLifecycle:
             if not COUNTDOWN_SCRIPT.is_file():
                 raise FileNotFoundError(f'Countdown helper missing: {COUNTDOWN_SCRIPT}')
             check_cancel(session.cancel)
+            if options.source == 'region':
+                try:
+                    if BORDER_SCRIPT.is_file():
+                        owner.spawn('countdown_border', [sys.executable, str(BORDER_SCRIPT),
+                                                         *map(str, geometry)])
+                except OSError:
+                    pass  # Countdown preview is optional; recording border is separate.
+            check_cancel(session.cancel)
             child = owner.spawn('countdown', [sys.executable, str(COUNTDOWN_SCRIPT)])
             deadline = time.monotonic() + 15
             while child.poll() is None:
@@ -255,6 +263,10 @@ class RecordingLifecycle:
             self._post(session, lambda: self._authorize(session))
             while not session.authorized.wait(0.05):
                 check_cancel(session.cancel)
+            check_cancel(session.cancel)
+            # Never capture the preview: a failed reap retains ownership and aborts
+            # startup, even after escalation. Cancellation can arrive during wait.
+            owner.reap('countdown_border')
             check_cancel(session.cancel)
             output = self.engine.start(region=geometry, fps=options.fps,
                                        quality=options.quality, audio=options.audio,

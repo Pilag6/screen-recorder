@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from engine.lifecycle import OwnedProcesses, RecordingLifecycle
+from engine.lifecycle import BORDER_SCRIPT, COUNTDOWN_SCRIPT, OwnedProcesses, RecordingLifecycle
 from engine.indicator_launcher import IndicatorPlan
 from recorder import RecordingOptions
 
@@ -53,6 +53,7 @@ class LifecycleTests(unittest.TestCase):
         self.engine.is_recording.return_value = True
         self.engine.stop.return_value = Path('recording.mkv')
         self.countdown = Child(0)
+        self.preview = Child()
         self.border = Child()
         self.indicator = Child()
         self.plan = patch('engine.lifecycle.indicator_plan', return_value=IndicatorPlan(
@@ -74,7 +75,9 @@ class LifecycleTests(unittest.TestCase):
     def popen(self, command, **kwargs):
         if 'safe-indicator' in command:
             return self.indicator
-        return self.border if 'recording-border.py' in str(command) else self.countdown
+        if 'recording-border.py' in str(command):
+            return self.border if self.engine.start.called else self.preview
+        return self.countdown
 
     def cleanup(self):
         self.life.close()
@@ -140,6 +143,194 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn(('terminate',), self.border.calls)
         self.assertTrue(any(c[0] == 'wait' for c in self.border.calls))
 
+    def test_preview_reaped_before_ffmpeg_then_recording_border_spawned(self):
+        from engine.recording import RecordingEngine
+        events = []
+        real_engine = RecordingEngine()
+        real_engine.select_region = Mock(return_value=(-12, 20, 101, 99))
+        self.life.engine = real_engine
+        ffmpeg = Child()
+        borders = iter((self.preview, self.border))
+        terminate, wait = self.preview.terminate, self.preview.wait
+        def preview_terminate():
+            events.append('preview terminate')
+            terminate()
+        def preview_wait(timeout=None):
+            events.append('preview wait')
+            return wait(timeout)
+        self.preview.terminate = preview_terminate
+        self.preview.wait = preview_wait
+        def popen(command, **kwargs):
+            if str(BORDER_SCRIPT) in command:
+                child = next(borders)
+                events.append('preview spawn' if child is self.preview else 'border spawn')
+                self.assertEqual(command[-4:], ['-12', '20', '100', '98'])
+                return child
+            if command[0] == 'ffmpeg':
+                events.append('ffmpeg spawn')
+                self.assertNotIn('countdown_border', real_engine.owner.children)
+                self.assertIn('100x98', command)
+                self.assertTrue(any(arg.endswith('+-12,20') for arg in command))
+                return ffmpeg
+            return self.popen(command, **kwargs)
+        self.spawn_mock.side_effect = popen
+        with patch('pathlib.Path.mkdir'), patch('pathlib.Path.stat', return_value=Mock(st_size=42)):
+            self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+            self.authorize()
+            self.next_callback()
+            self.assertEqual(events, ['preview spawn', 'preview terminate', 'preview wait',
+                                      'ffmpeg spawn', 'border spawn'])
+            self.assertFalse(self.border.calls)
+            self.life.cancel()
+            self.finish()
+        self.assertIn(('terminate',), self.border.calls)
+        self.assertIn(('wait', 3), self.border.calls)
+
+    def test_preview_survives_queued_authorization_and_cancel_or_close_reaps_it(self):
+        for close in (False, True):
+            with self.subTest(close=close):
+                self.preview = Child()
+                self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+                self.next_callback()  # countdown state
+                authorize = self.queue.get(timeout=2)  # Hold GTK authorization callback.
+                self.assertEqual(self.life.state, 'countdown')
+                self.assertFalse(self.preview.calls)
+                self.assertTrue(any(str(BORDER_SCRIPT) in call.args[0]
+                                    for call in self.spawn_mock.call_args_list))
+                (self.life.close if close else self.life.cancel)()
+                authorize()  # Stale GTK authorization must remain inert.
+                self.finish()
+                self.engine.start.assert_not_called()
+                self.assertIn(('terminate',), self.preview.calls)
+                self.assertIn(('wait', 3), self.preview.calls)
+                self.assertEqual(self.life.state, 'closed' if close else 'idle')
+
+    def test_live_region_countdown_cancel_or_close_reaps_preview_without_output(self):
+        from engine.recording import RecordingEngine
+        self.life.engine = RecordingEngine()
+        self.life.engine.select_region = Mock(return_value=(10, 20, 101, 99))
+        for close in (False, True):
+            with self.subTest(close=close), patch('pathlib.Path.mkdir') as mkdir:
+                self.preview = Child()
+                self.countdown = Child()
+                spawned = threading.Event()
+                def popen(command, **kwargs):
+                    child = self.popen(command, **kwargs)
+                    if str(COUNTDOWN_SCRIPT) in command:
+                        spawned.set()
+                    return child
+                self.spawn_mock.side_effect = popen
+                self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+                self.assertTrue(spawned.wait(2))
+                (self.life.close if close else self.life.cancel)()
+                self.finish()
+                mkdir.assert_not_called()
+                self.assertIn(('terminate',), self.preview.calls)
+                self.assertIn(('wait', 3), self.preview.calls)
+                self.assertIn(('wait', 3), self.countdown.calls)
+        self.assertFalse(any(call.args[0][0] == 'ffmpeg'
+                             for call in self.spawn_mock.call_args_list))
+
+    def test_countdown_failure_timeout_or_spawn_failure_reaps_preview(self):
+        for failure in ('exit', 'timeout', 'spawn'):
+            with self.subTest(failure=failure):
+                self.preview = Child()
+                self.countdown = Child(1 if failure == 'exit' else None)
+                def popen(command, **kwargs):
+                    if failure == 'spawn' and str(COUNTDOWN_SCRIPT) in command:
+                        raise OSError('countdown unavailable')
+                    return self.popen(command, **kwargs)
+                self.spawn_mock.side_effect = popen
+                with patch('engine.lifecycle.time.monotonic', side_effect=[0, 16]):
+                    self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+                    self.finish()
+                self.engine.start.assert_not_called()
+                self.assertEqual(self.life.state, 'idle')
+                self.assertIn(('terminate',), self.preview.calls)
+                self.assertIn(('wait', 3), self.preview.calls)
+
+    def test_missing_or_spawn_failed_preview_is_optional(self):
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                self.engine.start.reset_mock()
+                def popen(command, **kwargs):
+                    if str(BORDER_SCRIPT) in command and not self.engine.start.called:
+                        raise OSError('preview unavailable')
+                    return self.popen(command, **kwargs)
+                self.spawn_mock.side_effect = popen
+                with patch('engine.lifecycle.BORDER_SCRIPT') as helper:
+                    helper.is_file.return_value = not missing
+                    helper.__str__.return_value = str(BORDER_SCRIPT)
+                    self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+                    self.authorize()
+                    self.next_callback()
+                    self.assertEqual(self.life.state, 'recording')
+                    self.engine.start.assert_called_once()
+                    self.life.cancel()
+                    self.finish()
+                self.assertEqual(self.life.state, 'idle')
+
+    def test_exited_or_escalated_preview_is_reaped_before_start(self):
+        for exited in (True, False):
+            with self.subTest(exited=exited):
+                self.engine.start.reset_mock()
+                self.preview = Child(7 if exited else None, stubborn=not exited)
+                def start(**kwargs):
+                    self.assertNotIn('countdown_border', kwargs['owner'].children)
+                    self.assertIn(('wait', 3), self.preview.calls)
+                    if not exited:
+                        self.assertIn(('kill',), self.preview.calls)
+                    return Path('recording.mkv')
+                self.engine.start.side_effect = start
+                self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+                self.authorize()
+                self.next_callback()
+                self.assertEqual(self.life.state, 'recording')
+                self.engine.start.assert_called_once()
+                self.life.cancel()
+                self.finish()
+                if exited:
+                    self.assertNotIn(('terminate',), self.preview.calls)
+
+    def test_cancel_during_preview_reap_is_checked_before_start(self):
+        wait = self.preview.wait
+        def preview_wait(timeout=None):
+            self.life.session.cancel.set()
+            return wait(timeout)
+        self.preview.wait = preview_wait
+        self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+        self.authorize()
+        self.finish()
+        self.engine.start.assert_not_called()
+        self.assertEqual(self.life.state, 'idle')
+        self.assertIn(('wait', 3), self.preview.calls)
+
+    def test_unreapable_preview_blocks_start_and_retains_cleanup_ownership(self):
+        self.preview.stubborn = True
+        self.preview.kill = Mock()  # All bounded waits fail, including cleanup retry.
+        self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+        self.authorize()
+        self.finish()
+        self.engine.start.assert_not_called()
+        self.engine.stop.assert_not_called()
+        self.assertEqual(self.life.state, 'cleanup_failed')
+        self.assertIs(self.life.cleanup_owner.children['countdown_border'], self.preview)
+        self.assertIn('countdown_border', self.life.cleanup_owner.escalated)
+        self.assertTrue(all(call[1] is not None for call in self.preview.calls
+                            if call[0] == 'wait'))
+        self.assertFalse(self.life.begin(self.options))
+        self.life.close()
+        self.finish()
+        self.assertEqual(self.life.state, 'cleanup_failed')
+        self.assertNotIn('closed', [state[0] for state in self.states])
+        self.preview.code = 0
+        self.life.close()
+        self.finish()
+        self.assertEqual(self.life.state, 'closed')
+        self.assertIsNone(self.life.cleanup_owner)
+        self.assertIsNone(self.life.session)
+        self.engine.start.assert_not_called()
+
     def test_close_during_start_waits_off_caller_and_cleans_returned_process(self):
         entered, release = threading.Event(), threading.Event()
         def start(**kwargs):
@@ -167,14 +358,18 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn('unexpectedly', self.states[-1][1])
         self.assertEqual(self.life.state, 'idle')
 
-    def test_early_ffmpeg_exit_never_shows_rec_or_border(self):
+    def test_early_ffmpeg_exit_never_shows_rec_or_recording_border(self):
         self.engine.is_recording.return_value = False
         self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
         self.authorize()
         self.finish()
-        self.assertFalse(any('safe-indicator' in call.args[0] or
-                             'recording-border.py' in str(call.args[0])
+        self.assertFalse(any('safe-indicator' in call.args[0]
                              for call in self.spawn_mock.call_args_list))
+        borders = [call.args[0] for call in self.spawn_mock.call_args_list
+                   if str(BORDER_SCRIPT) in call.args[0]]
+        self.assertEqual(len(borders), 1)  # Preview only; never a recording border.
+        self.assertIn(('wait', 3), self.preview.calls)
+        self.assertFalse(self.border.calls)
         self.assertNotIn('recording', [state[0] for state in self.states])
         self.assertIn('unexpectedly', self.states[-1][1])
 
