@@ -1,6 +1,7 @@
 import signal
 import subprocess
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -44,7 +45,8 @@ class EngineTests(unittest.TestCase):
                         child = Mock()
                         child.poll.return_value = None
                         with patch('engine.recording.subprocess.Popen', return_value=child) as spawn, \
-                             patch('pathlib.Path.mkdir'), \
+                             patch('engine.recording.prepare_output_directory',
+                                   return_value=Path.home() / 'Videos/Recordings'), \
                              patch.object(engine, 'get_default_audio_devices', return_value=('sink.monitor', 'mic')):
                             output = engine.start(region=(-10, 4, 101, 99), audio=audio,
                                                   fps=fps, quality=quality)
@@ -62,6 +64,97 @@ class EngineTests(unittest.TestCase):
                             self.assertIn('mic', command)
                         if audio == 'both':
                             self.assertIn('[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[a]', command)
+
+    def test_output_options_default_and_legacy_arguments(self):
+        options = RecordingOptions('region', 'none', 30, 'high')
+        self.assertEqual(options.output_dir, str(Path.home() / 'Videos/Recordings'))
+        custom = RecordingOptions('region', 'none', 30, 'high', '/custom clips/日本語')
+        custom.validate()
+        self.assertEqual(custom.to_arguments(), options.to_arguments())
+        for value in ('relative', '', '/bad\x00path', None, 123):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RecordingOptions('region', 'none', 30, 'high', value).validate()
+
+    def test_directory_helper_creates_parents_and_removes_probe(self):
+        from recorder import prepare_output_directory
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / 'new' / 'Clips 日本語'
+            self.assertEqual(prepare_output_directory(str(folder)), folder)
+            self.assertTrue(folder.is_dir())
+            self.assertEqual(list(folder.iterdir()), [])
+            file = Path(root) / 'not-a-directory'
+            file.write_text('file')
+            with self.assertRaises(OSError):
+                prepare_output_directory(str(file))
+
+    def test_probe_write_failure_removes_probe(self):
+        from recorder import prepare_output_directory
+        factory = tempfile.NamedTemporaryFile
+        with tempfile.TemporaryDirectory() as root:
+            for method in ('write', 'flush'):
+                def failing_probe(**kwargs):
+                    probe = factory(**kwargs)
+                    setattr(probe, method, Mock(side_effect=PermissionError('read-only')))
+                    return probe
+                with self.subTest(method=method), \
+                     patch('recorder.tempfile.NamedTemporaryFile', side_effect=failing_probe):
+                    with self.assertRaises(PermissionError):
+                        prepare_output_directory(root)
+                self.assertEqual(list(Path(root).iterdir()), [])
+            with patch('recorder.os.fsync', side_effect=PermissionError('read-only')):
+                with self.assertRaises(PermissionError):
+                    prepare_output_directory(root)
+            self.assertEqual(list(Path(root).iterdir()), [])
+
+    def test_directory_creation_and_probe_open_denied_never_spawn(self):
+        with tempfile.TemporaryDirectory() as root:
+            for target in ('recorder.Path.mkdir', 'recorder.tempfile.NamedTemporaryFile'):
+                with self.subTest(target=target), \
+                     patch(target, side_effect=PermissionError('denied')), \
+                     patch('engine.recording.subprocess.Popen') as spawn:
+                    with self.assertRaises(PermissionError):
+                        RecordingEngine().start(region=(0, 0, 100, 100), output_dir=root)
+                    spawn.assert_not_called()
+            self.assertEqual(list(Path(root).iterdir()), [])
+
+    def test_custom_output_is_ffmpeg_destination_without_default_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / 'custom clips' / '日本語'
+            with patch('engine.recording.subprocess.Popen') as spawn:
+                output = RecordingEngine().start(region=(0, 0, 100, 100),
+                                                  output_dir=str(folder))
+            self.assertEqual(output.parent, folder)
+            self.assertEqual(spawn.call_args.args[0][-1], str(output))
+            self.assertEqual(list(folder.iterdir()), [])  # Only a mocked capture.
+
+    def test_invalid_or_unwritable_output_never_spawns(self):
+        with tempfile.TemporaryDirectory() as root:
+            file = Path(root) / 'file'
+            file.touch()
+            for folder in ('relative', str(file)):
+                with self.subTest(folder=folder), \
+                     patch('engine.recording.subprocess.Popen') as spawn:
+                    with self.assertRaises((ValueError, OSError)):
+                        RecordingEngine().start(region=(0, 0, 100, 100), output_dir=folder)
+                    spawn.assert_not_called()
+            with patch('recorder.os.fsync', side_effect=PermissionError('denied')), \
+                 patch('engine.recording.subprocess.Popen') as spawn:
+                with self.assertRaises(PermissionError):
+                    RecordingEngine().start(region=(0, 0, 100, 100), output_dir=root)
+                spawn.assert_not_called()
+            self.assertEqual(list(Path(root).iterdir()), [file])
+
+    def test_cancel_during_folder_validation_prevents_spawn(self):
+        event = threading.Event()
+        def prepare(folder):
+            event.set()
+            return Path(folder)
+        with patch('engine.recording.prepare_output_directory', side_effect=prepare), \
+             patch('engine.recording.subprocess.Popen') as spawn:
+            with self.assertRaises(Cancelled):
+                RecordingEngine().start(region=(0, 0, 100, 100), cancel=event,
+                                        output_dir='/custom clips')
+        spawn.assert_not_called()
 
     def test_monitor_supports_negative_offsets(self):
         engine = RecordingEngine()

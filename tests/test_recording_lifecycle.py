@@ -99,6 +99,33 @@ class LifecycleTests(unittest.TestCase):
         while not self.queue.empty():
             self.next_callback()
 
+    def test_output_folder_snapshot_forwarded_to_engine(self):
+        options = RecordingOptions('monitor', 'none', 30, 'high', '/custom clips/日本語')
+        self.life.begin(options)
+        self.authorize()
+        self.next_callback()
+        self.assertEqual(self.engine.start.call_args.kwargs['output_dir'], options.output_dir)
+        self.life.cancel()
+        self.finish()
+        self.assertEqual(self.life.state, 'idle')
+
+    def test_real_engine_folder_failure_returns_idle_without_ffmpeg_or_completion(self):
+        import tempfile
+        from engine.recording import RecordingEngine
+        self.life.engine = RecordingEngine()
+        self.life.engine.get_monitor_geometry = Mock(return_value=(0, 0, 100, 100))
+        with tempfile.TemporaryDirectory() as root, \
+             patch('recorder.os.fsync', side_effect=PermissionError('output folder denied')):
+            self.life.begin(RecordingOptions('monitor', 'none', 30, 'high', root))
+            self.authorize()
+            self.finish()
+            self.assertEqual(list(Path(root).iterdir()), [])
+        self.assertEqual(self.life.state, 'idle')
+        self.assertIsNone(self.life.session)
+        self.assertIsNone(self.life.completion)
+        self.assertIn('output folder denied', self.states[-1][1])
+        self.assertFalse(any(call.args[0][0] == 'ffmpeg' for call in self.spawn_mock.call_args_list))
+
     def test_cancel_after_countdown_exit_before_callback_never_starts(self):
         self.life.begin(self.options)
         self.queue.get(timeout=2)  # Leave callbacks stale, even after normal helper exit.
@@ -174,7 +201,8 @@ class LifecycleTests(unittest.TestCase):
                 return ffmpeg
             return self.popen(command, **kwargs)
         self.spawn_mock.side_effect = popen
-        with patch('pathlib.Path.mkdir'), patch('pathlib.Path.stat', return_value=Mock(st_size=42)):
+        with patch('engine.recording.prepare_output_directory', return_value=Path('/mock recordings')), \
+             patch('pathlib.Path.stat', return_value=Mock(st_size=42)):
             self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
             self.authorize()
             self.next_callback()
@@ -444,7 +472,8 @@ class LifecycleTests(unittest.TestCase):
                 return ffmpeg
             return self.popen(command, **kwargs)
         self.spawn_mock.side_effect = popen
-        with patch('pathlib.Path.mkdir'), patch('pathlib.Path.stat', return_value=Mock(st_size=42)):
+        with patch('engine.recording.prepare_output_directory', return_value=Path('/mock recordings')), \
+             patch('pathlib.Path.stat', return_value=Mock(st_size=42)):
             self.life.begin(RecordingOptions('monitor', 'none', 30, 'high'))
             self.authorize()
             self.assertTrue(entered.wait(2))

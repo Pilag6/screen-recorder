@@ -270,7 +270,8 @@ class RecordingLifecycle:
             check_cancel(session.cancel)
             output = self.engine.start(region=geometry, fps=options.fps,
                                        quality=options.quality, audio=options.audio,
-                                       cancel=session.cancel, owner=owner)
+                                       cancel=session.cancel, owner=owner,
+                                       output_dir=options.output_dir)
             started = True
             began = time.monotonic()
             check_cancel(session.cancel)

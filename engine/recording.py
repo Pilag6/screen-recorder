@@ -8,10 +8,8 @@ import uuid
 
 from engine.lifecycle import OwnedProcesses, check_cancel
 from datetime import datetime
-from pathlib import Path
 
-
-OUTPUT_DIR = Path.home() / "Videos" / "Recordings"
+from recorder import DEFAULT_OUTPUT_DIR, prepare_output_directory
 
 QUALITY_PRESETS = {
     "normal": 28,
@@ -181,6 +179,7 @@ class RecordingEngine:
         audio="none",
         cancel=None,
         owner=None,
+        output_dir=DEFAULT_OUTPUT_DIR,
     ):
         check_cancel(cancel)
         if self.is_recording():
@@ -215,15 +214,12 @@ class RecordingEngine:
         audio_args = self.build_audio_arguments(audio)
         check_cancel(cancel)
 
-        OUTPUT_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        directory = prepare_output_directory(output_dir)
 
         filename = datetime.now().strftime("Recording-%Y-%m-%d_%H-%M-%S")
         filename += f'-{uuid.uuid4().hex[:8]}.mkv'  # Never overwrite a rapid restart.
 
-        self.output_file = OUTPUT_DIR / filename
+        self.output_file = directory / filename
 
         command = [
             "ffmpeg",

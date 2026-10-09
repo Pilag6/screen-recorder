@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import tempfile
 
+from recorder import DEFAULT_OUTPUT_DIR, normalize_output_directory
+
 
 @dataclass(frozen=True)
 class Preferences:
@@ -12,6 +14,7 @@ class Preferences:
     audio: str = 'both'
     fps: int = 30
     quality: str = 'high'
+    output_dir: str = DEFAULT_OUTPUT_DIR
 
 
 def settings_path():
@@ -40,11 +43,18 @@ def load_preferences(path=None):
     audio = document.get('audio')
     fps = document.get('fps')
     quality = document.get('quality')
+    output_dir = defaults.output_dir
+    if isinstance(document.get('output_dir'), str):
+        try:
+            output_dir = str(normalize_output_directory(document['output_dir']))
+        except ValueError:
+            pass
     return Preferences(
         source=source if isinstance(source, str) and source else defaults.source,
         audio=audio if audio in ('none', 'system', 'mic', 'both') else defaults.audio,
         fps=fps if type(fps) is int and fps in (30, 60) else defaults.fps,
         quality=quality if quality in ('normal', 'high') else defaults.quality,
+        output_dir=output_dir,
     )
 
 

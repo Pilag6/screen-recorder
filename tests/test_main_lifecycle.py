@@ -24,6 +24,7 @@ def load_main(gtk=None, pixbuf=None):
     repository.Gtk = gtk or SimpleNamespace(Window=object, Application=InertApplication,
                                             main_quit=Mock())
     repository.Gdk = SimpleNamespace()
+    repository.Pango = SimpleNamespace(EllipsizeMode=SimpleNamespace(MIDDLE=2))
     repository.GLib = SimpleNamespace(idle_add=Mock(), timeout_add_seconds=Mock(),
                                       Error=RuntimeError)
     repository.GdkPixbuf = pixbuf or SimpleNamespace(
@@ -42,6 +43,7 @@ class MainTests(unittest.TestCase):
         self.ui.lifecycle = SimpleNamespace(state='countdown', closed=False,
                                            cancel=Mock(), close=Mock(), started_at=None, token=0)
         self.ui.start_button = Mock()
+        self.ui.change_output_button = Mock()
         self.ui.status = Mock()
         self.ui.source_container = Mock()
         self.ui.audio = self.ui.fps = self.ui.quality = {'x': Mock()}
@@ -59,6 +61,17 @@ class MainTests(unittest.TestCase):
         self.ui._monitor_pending = False
         self.ui._monitor_generation = 0
 
+    def test_output_change_disabled_in_every_nonidle_state_and_when_closed(self):
+        for state in ('selecting', 'countdown', 'starting', 'recording', 'stopping',
+                      'cleanup_failed', 'closed', 'idle'):
+            with self.subTest(state=state):
+                self.ui.lifecycle.state = state
+                self.ui.update_button()
+                self.ui.change_output_button.set_sensitive.assert_called_with(state == 'idle')
+        self.ui.lifecycle.closed = True
+        self.ui.update_button()
+        self.ui.change_output_button.set_sensitive.assert_called_with(False)
+
     def test_countdown_label_and_cancel(self):
         self.ui.update_button()
         self.ui.start_button.set_label.assert_called_with('Cancel Recording')
@@ -68,10 +81,13 @@ class MainTests(unittest.TestCase):
 
     def test_close_defers_quit_until_cleanup_callback(self):
         self.assertTrue(self.ui.on_close(None, None))
+        self.ui.change_output_button.set_sensitive.assert_called_with(False)
         self.ui.lifecycle.close.assert_called_once()
         self.application.quit.assert_not_called()
         self.ui.lifecycle.state = 'closed'
+        self.ui.change_output_button.reset_mock()
         self.ui.on_lifecycle_state('closed', 'Closed', None)
+        self.ui.change_output_button.set_sensitive.assert_called_with(False)
         self.application.quit.assert_called_once()
 
     def test_stale_monitor_results_do_not_update_busy_or_closed_ui(self):
@@ -379,6 +395,176 @@ class MainPreferencesTests(unittest.TestCase):
 
     def monitors(self):
         return [{'id': 'DP-1', 'label': 'DisplayPort'}]
+
+    def chooser(self, response=1, filename='/custom clips/日本語'):
+        dialog = Mock()
+        dialog.run.return_value = response
+        dialog.get_filename.return_value = filename
+        self.module.Gtk.FileChooserDialog = Mock(return_value=dialog)
+        self.module.Gtk.FileChooserAction = SimpleNamespace(SELECT_FOLDER=2)
+        self.module.Gtk.ResponseType = SimpleNamespace(CANCEL=0, ACCEPT=1)
+        return dialog
+
+    def test_restored_output_label_is_bounded_readable_and_snapshotted(self):
+        saved = self.Preferences(output_dir='/custom clips/日本語')
+        self.loader.return_value = saved
+        ui = self.module.ScreenRecorder()
+        ui.output_label.set_text.assert_called_with(saved.output_dir)
+        ui.output_label.set_tooltip_text.assert_called_with(saved.output_dir)
+        ui.output_label.set_ellipsize.assert_called_once_with(self.module.Pango.EllipsizeMode.MIDDLE)
+        ui.output_label.set_max_width_chars.assert_called_once()
+        ui.output_label.set_selectable.assert_called_once_with(True)
+        options = ui.get_options()
+        self.assertEqual(options.output_dir, saved.output_dir)
+        ui.preferences = self.Preferences(output_dir='/other')
+        self.assertEqual(options.output_dir, saved.output_dir)
+        self.saver.assert_not_called()
+
+    def test_chooser_accept_local_folder_validates_persists_and_always_destroys(self):
+        dialog = self.chooser()
+        with patch.object(self.module, 'prepare_output_directory',
+                          return_value=Path('/custom clips/日本語')) as prepare:
+            self.ui.on_change_output_clicked(None)
+        kwargs = self.module.Gtk.FileChooserDialog.call_args.kwargs
+        self.assertIs(kwargs['transient_for'], self.ui)
+        self.assertTrue(kwargs['modal'])
+        self.assertEqual(kwargs['action'], self.module.Gtk.FileChooserAction.SELECT_FOLDER)
+        dialog.set_local_only.assert_called_once_with(True)
+        dialog.set_current_folder.assert_called_once_with(self.saved.output_dir)
+        dialog.add_buttons.assert_called_once_with('Cancel', 0, 'Select', 1)
+        prepare.assert_called_once_with('/custom clips/日本語')
+        self.assertEqual(self.ui.preferences.output_dir, '/custom clips/日本語')
+        self.saver.assert_called_once_with(self.ui.preferences)
+        self.ui.output_label.set_text.assert_called_with('/custom clips/日本語')
+        dialog.destroy.assert_called_once()
+
+    def test_chooser_cancel_keeps_preferences_and_destroys(self):
+        dialog = self.chooser(response=0)
+        with patch.object(self.module, 'prepare_output_directory') as prepare:
+            self.ui.on_change_output_clicked(None)
+        prepare.assert_not_called()
+        self.saver.assert_not_called()
+        self.assertEqual(self.ui.preferences, self.saved)
+        dialog.get_filename.assert_not_called()
+        dialog.destroy.assert_called_once()
+
+    def test_chooser_validation_failure_preserves_selection_with_actionable_status(self):
+        for filename, error in (('/denied', PermissionError('Permission denied')),
+                                (None, ValueError('Choose a local absolute folder'))):
+            with self.subTest(filename=filename):
+                dialog = self.chooser(filename=filename)
+                with patch.object(self.module, 'prepare_output_directory', side_effect=error):
+                    self.ui.on_change_output_clicked(None)
+                self.assertEqual(self.ui.preferences, self.saved)
+                self.saver.assert_not_called()
+                status = self.ui.status.set_text.call_args.args[0]
+                self.assertIn(str(error), status)
+                self.assertIn('choose', status.lower())
+                dialog.destroy.assert_called_once()
+
+    def test_chooser_persistence_error_preserves_previous_selection(self):
+        dialog = self.chooser()
+        self.saver.return_value = False
+        with patch.object(self.module, 'prepare_output_directory', return_value=Path('/custom')):
+            self.ui.on_change_output_clicked(None)
+        self.assertEqual(self.ui.preferences, self.saved)
+        self.ui.output_label.set_text.assert_called_with(self.saved.output_dir)
+        self.assertIn('settings', self.ui.status.set_text.call_args.args[0].lower())
+        dialog.destroy.assert_called_once()
+
+    def test_chooser_never_opens_busy_or_closed_and_rechecks_after_nested_loop(self):
+        for state, closed in (('countdown', False), ('starting', False), ('recording', False),
+                              ('stopping', False), ('idle', True)):
+            with self.subTest(state=state, closed=closed):
+                dialog = self.chooser()
+                self.ui.lifecycle.state, self.ui.lifecycle.closed = state, closed
+                self.ui.on_change_output_clicked(None)
+                self.module.Gtk.FileChooserDialog.assert_not_called()
+        for state, closed in (('countdown', False), ('recording', False), ('idle', True)):
+            with self.subTest(accepted_state=state, closed=closed):
+                dialog = self.chooser()
+                self.ui.lifecycle.state, self.ui.lifecycle.closed = 'idle', False
+                def run():
+                    self.ui.lifecycle.state, self.ui.lifecycle.closed = state, closed
+                    return 1
+                dialog.run.side_effect = run
+                with patch.object(self.module, 'prepare_output_directory') as prepare:
+                    self.ui.on_change_output_clicked(None)
+                prepare.assert_not_called()
+                self.saver.assert_not_called()
+                self.assertEqual(self.ui.preferences, self.saved)
+                dialog.destroy.assert_called_once()
+
+    def test_dialog_constructor_errors_are_nonfatal_and_do_not_destroy(self):
+        self.module.GLib.Error = type('ChooserError', (Exception,), {})
+        for error_type in (RuntimeError, OSError, self.module.GLib.Error):
+            with self.subTest(error_type=error_type):
+                dialog = self.chooser()
+                self.module.Gtk.FileChooserDialog.side_effect = error_type('chooser unavailable')
+                self.ui.on_change_output_clicked(None)
+                self.assertEqual(self.ui.preferences, self.saved)
+                self.saver.assert_not_called()
+                self.assertIn('chooser unavailable', self.ui.status.set_text.call_args.args[0])
+                dialog.destroy.assert_not_called()
+
+    def test_dialog_run_error_still_destroys_and_preserves_preferences(self):
+        self.module.GLib.Error = type('ChooserError', (Exception,), {})
+        for error_type in (RuntimeError, OSError, self.module.GLib.Error):
+            with self.subTest(error_type=error_type):
+                dialog = self.chooser()
+                dialog.run.side_effect = error_type('chooser unavailable')
+                self.ui.on_change_output_clicked(None)
+                self.assertEqual(self.ui.preferences, self.saved)
+                self.saver.assert_not_called()
+                self.assertIn('chooser unavailable', self.ui.status.set_text.call_args.args[0])
+                dialog.destroy.assert_called_once()
+
+    def test_dialog_destroy_errors_are_nonfatal_after_cancel(self):
+        self.module.GLib.Error = type('ChooserError', (Exception,), {})
+        for error_type in (RuntimeError, OSError, self.module.GLib.Error):
+            with self.subTest(error_type=error_type):
+                dialog = self.chooser(response=0)
+                dialog.destroy.side_effect = error_type('cleanup unavailable')
+                self.ui.on_change_output_clicked(None)
+                self.assertEqual(self.ui.preferences, self.saved)
+                self.saver.assert_not_called()
+                status = self.ui.status.set_text.call_args.args[0]
+                self.assertIn('cleanup unavailable', status)
+                self.assertIn('chooser', status.lower())
+                dialog.destroy.assert_called_once()
+
+    def test_dialog_destroy_error_does_not_undo_accepted_preferences(self):
+        dialog = self.chooser()
+        dialog.destroy.side_effect = RuntimeError('cleanup unavailable')
+        with patch.object(self.module, 'prepare_output_directory', return_value=Path('/custom')):
+            self.ui.on_change_output_clicked(None)
+        self.assertEqual(self.ui.preferences.output_dir, '/custom')
+        self.saver.assert_called_once_with(self.ui.preferences)
+        self.ui.output_label.set_text.assert_called_with('/custom')
+        self.assertIn('cleanup unavailable', self.ui.status.set_text.call_args.args[0])
+        dialog.destroy.assert_called_once()
+
+    def test_dialog_programmer_errors_are_not_swallowed(self):
+        for stage in ('constructor', 'run', 'destroy'):
+            with self.subTest(stage=stage):
+                dialog = self.chooser(response=0)
+                target = (self.module.Gtk.FileChooserDialog if stage == 'constructor'
+                          else getattr(dialog, stage))
+                target.side_effect = TypeError('programmer error')
+                with self.assertRaisesRegex(TypeError, 'programmer error'):
+                    self.ui.on_change_output_clicked(None)
+                self.assertEqual(self.ui.preferences, self.saved)
+                self.saver.assert_not_called()
+                if stage != 'constructor':
+                    dialog.destroy.assert_called_once()
+
+    def test_notification_uses_actual_custom_file_not_current_preference(self):
+        self.ui._notified_token = None
+        self.ui.lifecycle.completion = SavedRecording(1, Path('/actual clips/日本語/video.mkv'))
+        with patch('pathlib.Path.is_file', return_value=True):
+            self.ui.notify_completion()
+        self.ui.notifier.notify_saved.assert_called_once_with(
+            Path('/actual clips/日本語/video.mkv'), allow_actions=True)
 
     def test_constructor_installs_native_header_with_scaled_left_icon(self):
         self.ui.set_titlebar.assert_called_once()

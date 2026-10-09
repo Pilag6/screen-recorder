@@ -26,6 +26,17 @@ class NotificationTests(unittest.TestCase):
         self.gio.AppInfo.launch_default_for_uri.assert_called_once_with('file:///recordings', None)
         self.notice.show.assert_called_once()
 
+    def test_open_folder_uses_actual_custom_parent_with_spaces_and_unicode(self):
+        output = Path('/custom clips/日本語/Recording 1.mkv')
+        uri = 'file:///custom%20clips/%E6%97%A5%E6%9C%AC%E8%AA%9E'
+        self.gio.File.new_for_path.return_value.get_uri.return_value = uri
+        self.assertTrue(self.notifier.notify_saved(output))
+        action = self.notice.add_action.call_args.args
+        self.assertEqual(action[3], output.parent)
+        action[2](self.notice, 'open-folder', action[3])
+        self.gio.File.new_for_path.assert_called_once_with(str(output.parent))
+        self.gio.AppInfo.launch_default_for_uri.assert_called_once_with(uri, None)
+
     def test_plain_backend_and_no_actions_on_close(self):
         self.backend.get_server_caps.return_value = []
         self.assertTrue(self.notifier.notify_saved(Path('a<&.mkv')))

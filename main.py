@@ -12,9 +12,9 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Pango
 
-from recorder import RecordingOptions
+from recorder import RecordingOptions, prepare_output_directory
 from preferences import load_preferences, save_preferences
 from engine.recording import RecordingEngine
 from engine.lifecycle import RecordingLifecycle
@@ -157,9 +157,27 @@ class ScreenRecorder(Gtk.Window):
         )
 
         output_section = self.create_section(main, "Save to")
-        folder = self.create_label("~/Videos/Recordings")
-        folder.set_selectable(True)
-        output_section.pack_start(folder, False, False, 0)
+        output_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        output_section.pack_start(output_row, False, False, 0)
+        self.output_label = self.create_label('')
+        self.output_label.set_selectable(True)
+        self.output_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.output_label.set_max_width_chars(32)
+        output_row.pack_start(self.output_label, True, True, 0)
+        self.update_output_label()
+        self.change_output_button = Gtk.Button(label=' Change')
+        self.change_output_button.set_image(
+            Gtk.Image.new_from_icon_name('folder-open-symbolic', Gtk.IconSize.BUTTON)
+        )
+        self.change_output_button.set_always_show_image(True)
+        self.change_output_button.set_tooltip_text('Choose where recordings are saved')
+        self.change_output_button.add_events(
+            Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+        )
+        self.change_output_button.connect('enter-notify-event', self.on_button_enter)
+        self.change_output_button.connect('leave-notify-event', self.on_button_leave)
+        self.change_output_button.connect('clicked', self.on_change_output_clicked)
+        output_row.pack_start(self.change_output_button, False, False, 0)
 
         # A separate footer keeps feedback next to the session action.
         footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -299,6 +317,48 @@ class ScreenRecorder(Gtk.Window):
         self.preferences = replace(self.preferences, **{key: value})
         save_preferences(self.preferences)
 
+    def update_output_label(self):
+        self.output_label.set_text(self.preferences.output_dir)
+        self.output_label.set_tooltip_text(self.preferences.output_dir)
+
+    def on_change_output_clicked(self, button):
+        if self.lifecycle.closed or self.lifecycle.state != 'idle':
+            return
+        dialog = None
+        try:
+            dialog = Gtk.FileChooserDialog(
+                title='Choose recording output folder', transient_for=self, modal=True,
+                action=Gtk.FileChooserAction.SELECT_FOLDER,
+            )
+            dialog.add_buttons('Cancel', Gtk.ResponseType.CANCEL,
+                               'Select', Gtk.ResponseType.ACCEPT)
+            dialog.set_local_only(True)
+            dialog.set_current_folder(self.preferences.output_dir)
+            response = dialog.run()
+            # run() enters a nested GTK loop: a session/close may have begun.
+            if (response != Gtk.ResponseType.ACCEPT or self.lifecycle.closed
+                    or self.lifecycle.state != 'idle'):
+                return
+            directory = prepare_output_directory(dialog.get_filename())
+            candidate = replace(self.preferences, output_dir=str(directory))
+            if not save_preferences(candidate):
+                self.status.set_text('Output folder unchanged: could not save settings. '
+                                     'Check configuration folder permissions and free space, then retry.')
+                return
+            self.preferences = candidate
+            self.update_output_label()
+            self.status.set_text('Output folder updated. Ready to record.')
+        except (OSError, ValueError, RuntimeError, GLib.Error) as error:
+            self.status.set_text(f'Output folder unchanged: {error}. '
+                                 'Choose a writable local folder and check permissions/free space.')
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.destroy()
+                except (OSError, RuntimeError, GLib.Error) as error:
+                    self.status.set_text(f'Could not close output folder chooser: {error}. '
+                                         'Try closing the chooser or restarting the application.')
+
     def on_source_clicked(self, button, value):
         # Clicking an already-active region fallback emits no toggled signal.
         # A normal selection was already saved by toggled; do not save twice.
@@ -420,6 +480,7 @@ class ScreenRecorder(Gtk.Window):
         return True
 
     def set_controls_enabled(self, enabled):
+        self.change_output_button.set_sensitive(enabled and not self.lifecycle.closed)
         self.source_container.set_sensitive(enabled)
         for group in (self.audio, self.fps, self.quality):
             for button in group.values():
@@ -454,6 +515,7 @@ class ScreenRecorder(Gtk.Window):
             audio=self.get_selected(self.audio),
             fps=int(self.get_selected(self.fps)),
             quality=self.get_selected(self.quality),
+            output_dir=self.preferences.output_dir,
         )
         options.validate()
         return options
@@ -483,6 +545,7 @@ class ScreenRecorder(Gtk.Window):
         if state != 'recording':
             self.set_title('Screen Recorder')
         if state == 'closed':
+            self.change_output_button.set_sensitive(False)
             self.notifier.close()
             self.notify_completion()
             if 'error' in message.lower():
@@ -521,6 +584,7 @@ class ScreenRecorder(Gtk.Window):
 
     def on_close(self, widget, event):
         # Keep the GTK loop alive while the session worker cleans up. No waits here.
+        self.change_output_button.set_sensitive(False)
         self.notifier.close()
         self.hide()
         self.lifecycle.close()

@@ -44,7 +44,8 @@ class PreferencesTests(unittest.TestCase):
         self.assertEqual(load_preferences(self.path), expected)
         document = json.loads(self.path.read_text(encoding='utf-8'))
         self.assertEqual(document, {'version': 1, 'source': 'DP-1',
-                                    'audio': 'mic', 'fps': 60, 'quality': 'normal'})
+                                    'audio': 'mic', 'fps': 60, 'quality': 'normal',
+                                    'output_dir': expected.output_dir})
         self.assertIs(type(document['fps']), int)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
@@ -96,6 +97,32 @@ class PreferencesTests(unittest.TestCase):
                     expected = {key: valid[key] for key in invalid}
                     expected[field] = getattr(defaults, field)
                     self.assertEqual(load_preferences(self.path), Preferences(**expected))
+
+    def test_v1_missing_output_folder_defaults_without_creating_it(self):
+        self.write_document({'version': 1, 'audio': 'mic'})
+        with patch('pathlib.Path.mkdir') as mkdir:
+            restored = load_preferences(self.path)
+        self.assertEqual(restored.output_dir, str(Path.home() / 'Videos/Recordings'))
+        self.assertEqual(restored.audio, 'mic')
+        mkdir.assert_not_called()
+
+    def test_custom_output_roundtrip_and_expansion_are_side_effect_free(self):
+        folder = self.root / 'Clips con espacios' / '日本語'
+        expected = Preferences(output_dir=str(folder), fps=60)
+        self.assertTrue(save_preferences(expected, self.path))
+        self.assertEqual(load_preferences(self.path), expected)
+        self.assertFalse(folder.exists())
+        self.write_document({'version': 1, 'output_dir': '~/Custom clips'})
+        self.assertEqual(load_preferences(self.path).output_dir,
+                         str(Path.home() / 'Custom clips'))
+
+    def test_invalid_output_fields_default_independently(self):
+        for value in (None, '', ' ', True, 7, [], {}, 'relative', '/bad\x00path', '~no-such-recorder-user/folder'):
+            with self.subTest(value=value):
+                self.write_document({'version': 1, 'output_dir': value, 'fps': 60})
+                restored = load_preferences(self.path)
+                self.assertEqual(restored.output_dir, Preferences().output_dir)
+                self.assertEqual(restored.fps, 60)
 
     def test_default_api_uses_only_temporary_xdg_config(self):
         with patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.root)}):
