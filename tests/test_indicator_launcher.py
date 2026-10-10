@@ -1,13 +1,49 @@
+import hashlib
+import os
+import runpy
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from engine.indicator_launcher import (
+    HELPER_SHA256, INDICATOR_SCRIPT, helper_supported,
     indicator_plan, safe_position, PlacementGate, guarded_window_class, execute_helper,
 )
 from types import SimpleNamespace
 
 
 class IndicatorTests(unittest.TestCase):
+    def test_repository_helper_bytes_satisfy_pinned_hash(self):
+        helper = Path(__file__).resolve().parents[1] / 'helpers/recording-indicator.py'
+        self.assertEqual(INDICATOR_SCRIPT, helper)
+        self.assertTrue(helper.is_file())
+        self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), HELPER_SHA256)
+        self.assertTrue(helper_supported())
+
+    def test_helper_and_bootstrap_paths_ignore_home_and_cwd(self):
+        root = Path(__file__).resolve().parents[1]
+        bootstrap = root / 'engine/indicator_launcher.py'
+        for home, cwd in (('/nonexistent/recorder-home', '/'),
+                          ('/another/nonexistent-home', '/tmp')):
+            with self.subTest(home=home, cwd=cwd), \
+                 patch.dict(os.environ, {'HOME': home}), \
+                 patch('os.getcwd', return_value=cwd):
+                module = runpy.run_path(str(bootstrap))
+                self.assertEqual(module['INDICATOR_SCRIPT'],
+                                 root / 'helpers/recording-indicator.py')
+                plan = module['indicator_plan']((-12, 0, 100, 98))
+                self.assertIsNotNone(plan.command)
+                self.assertEqual(plan.command[1], str(bootstrap))
+                self.assertEqual(plan.command[-4:], ('-12', '0', '100', '98'))
+
+    def test_actual_checksum_gate_rejects_changed_or_missing_bytes(self):
+        for failure in ('changed', 'missing'):
+            with self.subTest(failure=failure), \
+                 patch.object(Path, 'read_bytes', return_value=b'changed helper',
+                              side_effect=FileNotFoundError() if failure == 'missing' else None):
+                self.assertFalse(helper_supported())
+                self.assertIsNone(indicator_plan((0, 0, 100, 100)).command)
+
     def test_verified_helper_uses_project_bootstrap_not_direct_launch(self):
         with patch('engine.indicator_launcher.helper_supported', return_value=True):
             plan = indicator_plan((-12, 0, 100, 98))

@@ -11,8 +11,8 @@ from pathlib import Path
 from engine.indicator_launcher import FALLBACK, indicator_plan
 
 
-COUNTDOWN_SCRIPT = Path.home() / '.local/bin/recording-countdown.py'
-BORDER_SCRIPT = Path.home() / '.local/bin/recording-border.py'
+COUNTDOWN_SCRIPT = Path(__file__).resolve().parents[1] / 'helpers' / 'recording-countdown.py'
+BORDER_SCRIPT = Path(__file__).resolve().parents[1] / 'helpers' / 'recording-border.py'
 
 
 class Cancelled(Exception):

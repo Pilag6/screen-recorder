@@ -1,4 +1,6 @@
+import os
 import queue
+import runpy
 import signal
 import subprocess
 import threading
@@ -40,6 +42,29 @@ class Child:
     def kill(self):
         self.calls.append(('kill',))
         self.code = -9
+
+
+class HelperPathTests(unittest.TestCase):
+    def test_helpers_exist_inside_repository(self):
+        helpers = Path(__file__).resolve().parents[1] / 'helpers'
+        for script, basename in ((COUNTDOWN_SCRIPT, 'recording-countdown.py'),
+                                 (BORDER_SCRIPT, 'recording-border.py')):
+            with self.subTest(helper=basename):
+                self.assertEqual(script, helpers / basename)
+                self.assertTrue(script.is_file())
+
+    def test_helper_paths_at_import_ignore_home_and_cwd(self):
+        root = Path(__file__).resolve().parents[1]
+        for home, cwd in (('/nonexistent/recorder-home', '/'),
+                          ('/another/nonexistent-home', '/tmp')):
+            with self.subTest(home=home, cwd=cwd), \
+                 patch.dict(os.environ, {'HOME': home}), \
+                 patch('os.getcwd', return_value=cwd):
+                module = runpy.run_path(str(root / 'engine/lifecycle.py'))
+                self.assertEqual(module['COUNTDOWN_SCRIPT'],
+                                 root / 'helpers/recording-countdown.py')
+                self.assertEqual(module['BORDER_SCRIPT'],
+                                 root / 'helpers/recording-border.py')
 
 
 class LifecycleTests(unittest.TestCase):
@@ -98,6 +123,21 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.life.worker.is_alive())
         while not self.queue.empty():
             self.next_callback()
+
+    def test_region_launches_existing_repository_helpers_with_inert_children(self):
+        self.exists.stop()  # Exercise real helper existence, never real subprocesses.
+        helpers = Path(__file__).resolve().parents[1] / 'helpers'
+        self.life.begin(RecordingOptions('region', 'none', 30, 'high'))
+        self.authorize()
+        self.next_callback()
+        self.life.cancel()
+        self.finish()
+        commands = [call.args[0] for call in self.spawn_mock.call_args_list]
+        self.assertEqual(sum(str(helpers / 'recording-countdown.py') in command
+                             for command in commands), 1)
+        self.assertEqual(sum(str(helpers / 'recording-border.py') in command
+                             for command in commands), 2)
+        self.assertEqual(self.life.state, 'idle')
 
     def test_output_folder_snapshot_forwarded_to_engine(self):
         options = RecordingOptions('monitor', 'none', 30, 'high', '/custom clips/日本語')

@@ -359,7 +359,9 @@ def construction_gtk():
         Box=InertWidget, Grid=InertWidget, Label=InertWidget,
         Button=InertWidget, Separator=InertWidget, RadioButton=InertRadio,
         HeaderBar=InertWidget,
-        Image=SimpleNamespace(new_from_pixbuf=Mock(return_value=InertWidget())),
+        Image=SimpleNamespace(new_from_pixbuf=Mock(return_value=InertWidget()),
+                              new_from_icon_name=Mock(return_value=InertWidget())),
+        IconSize=SimpleNamespace(BUTTON=1),
         Orientation=SimpleNamespace(VERTICAL=0, HORIZONTAL=1),
         WindowPosition=SimpleNamespace(CENTER=0),
     )

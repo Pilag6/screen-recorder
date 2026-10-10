@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-INDICATOR_SCRIPT = Path.home() / '.local/bin/recording-indicator.py'
+INDICATOR_SCRIPT = Path(__file__).resolve().parents[1] / 'helpers' / 'recording-indicator.py'
 
 
 @dataclass(frozen=True)
