@@ -15,17 +15,12 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Pango
 
 from recorder import RecordingOptions, prepare_output_directory
-from preferences import load_preferences, save_preferences
-from engine.recording import RecordingEngine
+from preferences import (load_preferences, save_preferences,
+                         monitor_source_token, source_monitor_id)
+from engine.recording import RecordingEngine, monitor_identity
 from engine.lifecycle import RecordingLifecycle
 from engine.notifications import DesktopNotifier
 
-
-MONITOR_NAMES = {
-    "eDP": "Acer",
-    "DVI-I-3-2": "Samsung arriba",
-    "DVI-I-2-1": "LG derecha",
-}
 
 def get_connected_monitors():
     try:
@@ -42,10 +37,10 @@ def get_connected_monitors():
 
     monitors = []
 
-    for line in result.stdout.splitlines()[1:]:
+    for index, line in enumerate(result.stdout.splitlines()[1:], start=1):
         parts = line.split()
 
-        if len(parts) < 4:
+        if len(parts) < 3:
             continue
 
         match = re.fullmatch(
@@ -58,11 +53,11 @@ def get_connected_monitors():
             continue
 
         width, height, x, y = map(int, match.groups())
-        name = parts[-1]
+        name = monitor_identity(parts)
 
         monitors.append({
             "id": name,
-            "label": MONITOR_NAMES.get(name, name),
+            "label": f"Display {index} ({name})",
             "x": x,
             "y": y,
             "width": width,
@@ -109,6 +104,11 @@ class ScreenRecorder(Gtk.Window):
 
         self.source = {}
         self.monitors = []
+        self.rename_monitor_button = Gtk.Button(label='Rename display')
+        self.rename_monitor_button.set_halign(Gtk.Align.START)
+        self.rename_monitor_button.set_tooltip_text('Rename the selected display; blank resets its name')
+        self.rename_monitor_button.connect('clicked', self.on_rename_monitor_clicked)
+        source_section.pack_start(self.rename_monitor_button, False, False, 0)
         self.refresh_monitors()
 
         audio_section = self.create_section(main, "Audio source")
@@ -316,6 +316,76 @@ class ScreenRecorder(Gtk.Window):
             value = int(value)
         self.preferences = replace(self.preferences, **{key: value})
         save_preferences(self.preferences)
+        if key == 'source':
+            self.update_rename_monitor_button()
+
+    def selected_connected_monitor(self):
+        selected = source_monitor_id(self.get_selected(self.source))
+        return next((monitor for monitor in self.monitors
+                     if monitor['id'] == selected), None)
+
+    def update_rename_monitor_button(self):
+        self.rename_monitor_button.set_sensitive(
+            not self.lifecycle.closed and self.lifecycle.state == 'idle'
+            and self.selected_connected_monitor() is not None
+        )
+
+    def on_rename_monitor_clicked(self, button):
+        if self.lifecycle.closed or self.lifecycle.state != 'idle':
+            return
+        monitor = self.selected_connected_monitor()
+        if monitor is None:
+            return
+        monitor_id, token = monitor['id'], self.lifecycle.token
+        dialog = None
+        try:
+            dialog = Gtk.Dialog(title='Rename display', transient_for=self, modal=True)
+            dialog.add_buttons('Cancel', Gtk.ResponseType.CANCEL,
+                               'Save', Gtk.ResponseType.ACCEPT)
+            dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+            content = dialog.get_content_area()
+            content.set_border_width(12)
+            content.set_spacing(8)
+            content.pack_start(self.create_label(monitor['label']), False, False, 0)
+            entry = Gtk.Entry()
+            entry.set_text(self.preferences.monitor_names.get(monitor_id, ''))
+            entry.set_placeholder_text('Blank restores the default display name')
+            entry.set_activates_default(True)
+            content.pack_start(entry, False, False, 0)
+            dialog.show_all()
+            response = dialog.run()
+            # Nested modal events can start/finish a session, close the window,
+            # change the selection or remove the captured real identifier.
+            current = self.selected_connected_monitor()
+            if (response != Gtk.ResponseType.ACCEPT or self.lifecycle.closed
+                    or self.lifecycle.state != 'idle' or self.lifecycle.token != token
+                    or current is None or current['id'] != monitor_id):
+                return
+            name = entry.get_text().strip()
+            if '\x00' in name:
+                raise ValueError('Display names cannot contain NUL characters')
+            names = dict(self.preferences.monitor_names)
+            if name:
+                names[monitor_id] = name
+            else:
+                names.pop(monitor_id, None)
+            candidate = replace(self.preferences, monitor_names=names)
+            if not save_preferences(candidate):
+                self.status.set_text('Display name unchanged: could not save settings. '
+                                     'Check configuration folder permissions and free space, then retry.')
+                return
+            self.preferences = candidate
+            self.refresh_monitors()
+            self.status.set_text('Display name updated. Ready to record.')
+        except (OSError, ValueError, RuntimeError, GLib.Error) as error:
+            self.status.set_text(f'Display name unchanged: {error}. Try renaming again.')
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.destroy()
+                except (OSError, RuntimeError, GLib.Error) as error:
+                    self.status.set_text(f'Could not close rename dialog: {error}. '
+                                         'Try closing the dialog or restarting the application.')
 
     def update_output_label(self):
         self.output_label.set_text(self.preferences.output_dir)
@@ -416,8 +486,9 @@ class ScreenRecorder(Gtk.Window):
 
         for monitor in monitors:
             options.append((
-                monitor["id"],
-                monitor["label"],
+                monitor_source_token(monitor['id']),
+                (preferences.monitor_names.get(monitor['id'], monitor['label'])
+                 if preferences is not None else monitor['label']),
             ))
 
         available = {value for value, _ in options}
@@ -437,6 +508,7 @@ class ScreenRecorder(Gtk.Window):
 
         self.source_container.show_all()
         self.monitors = monitors
+        self.update_rename_monitor_button()
 
     def check_monitor_changes(self):
         if self.lifecycle.closed:
@@ -480,6 +552,7 @@ class ScreenRecorder(Gtk.Window):
         return True
 
     def set_controls_enabled(self, enabled):
+        self.update_rename_monitor_button()
         self.change_output_button.set_sensitive(enabled and not self.lifecycle.closed)
         self.source_container.set_sensitive(enabled)
         for group in (self.audio, self.fps, self.quality):
@@ -545,6 +618,7 @@ class ScreenRecorder(Gtk.Window):
         if state != 'recording':
             self.set_title('Screen Recorder')
         if state == 'closed':
+            self.rename_monitor_button.set_sensitive(False)
             self.change_output_button.set_sensitive(False)
             self.notifier.close()
             self.notify_completion()
@@ -584,6 +658,7 @@ class ScreenRecorder(Gtk.Window):
 
     def on_close(self, widget, event):
         # Keep the GTK loop alive while the session worker cleans up. No waits here.
+        self.rename_monitor_button.set_sensitive(False)
         self.change_output_button.set_sensitive(False)
         self.notifier.close()
         self.hide()

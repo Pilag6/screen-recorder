@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from engine.indicator_launcher import FALLBACK, indicator_plan
+from preferences import source_monitor_id
 
 
 COUNTDOWN_SCRIPT = Path(__file__).resolve().parents[1] / 'helpers' / 'recording-countdown.py'
@@ -233,7 +234,9 @@ class RecordingLifecycle:
                 if geometry is None:
                     raise Cancelled()
             else:
-                geometry = self.engine.get_monitor_geometry(options.source)
+                # Only the selection token is escaped. The engine resolves raw
+                # xrandr IDs; FFmpeg receives the resulting geometry, not names.
+                geometry = self.engine.get_monitor_geometry(source_monitor_id(options.source))
             check_cancel(session.cancel)
             geometry = normalize_geometry(geometry)
             self._post(session, lambda: self._set_state('countdown', 'Countdown — cancel to abort'))

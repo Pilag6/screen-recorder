@@ -1,5 +1,5 @@
 """Small, GTK-independent storage for versioned user preferences."""
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
@@ -15,6 +15,26 @@ class Preferences:
     fps: int = 30
     quality: str = 'high'
     output_dir: str = DEFAULT_OUTPUT_DIR
+    monitor_names: dict = field(default_factory=dict)
+
+
+MONITOR_SOURCE_PREFIX = 'monitor:'
+
+
+def monitor_source_token(monitor_id):
+    """Reserve region for the picker; escape the prefix too to stay injective."""
+    if monitor_id == 'region' or monitor_id.startswith(MONITOR_SOURCE_PREFIX):
+        return MONITOR_SOURCE_PREFIX + monitor_id
+    return monitor_id
+
+
+def source_monitor_id(source):
+    """Decode one selection layer, never an alias; region is not a monitor."""
+    if source is None or source == 'region':
+        return None
+    if source.startswith(MONITOR_SOURCE_PREFIX):
+        return source[len(MONITOR_SOURCE_PREFIX):]
+    return source
 
 
 def settings_path():
@@ -49,7 +69,16 @@ def load_preferences(path=None):
             output_dir = str(normalize_output_directory(document['output_dir']))
         except ValueError:
             pass
+    monitor_names = document.get('monitor_names')
+    if not isinstance(monitor_names, dict):
+        monitor_names = {}
+    monitor_names = {
+        key: value.strip() for key, value in monitor_names.items()
+        if isinstance(key, str) and key.strip() and '\x00' not in key
+        and isinstance(value, str) and value.strip() and '\x00' not in value
+    }
     return Preferences(
+        monitor_names=monitor_names,
         source=source if isinstance(source, str) and source else defaults.source,
         audio=audio if audio in ('none', 'system', 'mic', 'both') else defaults.audio,
         fps=fps if type(fps) is int and fps in (30, 60) else defaults.fps,

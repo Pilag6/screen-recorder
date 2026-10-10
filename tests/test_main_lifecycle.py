@@ -44,6 +44,8 @@ class MainTests(unittest.TestCase):
                                            cancel=Mock(), close=Mock(), started_at=None, token=0)
         self.ui.start_button = Mock()
         self.ui.change_output_button = Mock()
+        self.ui.rename_monitor_button = Mock()
+        self.ui.source = {}
         self.ui.status = Mock()
         self.ui.source_container = Mock()
         self.ui.audio = self.ui.fps = self.ui.quality = {'x': Mock()}
@@ -274,6 +276,42 @@ class MainTests(unittest.TestCase):
         self.assertEqual(calls, ['disarm', 'notify', 'quit'])
         self.ui.notifier.notify_saved.assert_called_once_with(Path('real.mkv'), allow_actions=False)
 
+    def test_arbitrary_connectors_generic_labels_and_logical_identity(self):
+        result = Mock(stdout=('Monitors: 4\n'
+            ' 0: +*internal 1920/300x1080/200+0+0 eDP-7\n'
+            ' 1: +HDMI-A-9 1280x720-1280-20 HDMI-A-9\n'
+            ' 2: +wide 3200/600x1200/250+1920+0 DP-3 DP-4\n'
+            ' 3: +*virtual 800x600-800-600\n'))
+        with patch.object(self.module.subprocess, 'run', return_value=result) as run:
+            monitors = self.module.get_connected_monitors()
+        self.assertEqual(monitors, [
+            {'id': 'internal', 'label': 'Display 1 (internal)', 'x': 0, 'y': 0,
+             'width': 1920, 'height': 1080},
+            {'id': 'HDMI-A-9', 'label': 'Display 2 (HDMI-A-9)', 'x': -1280, 'y': -20,
+             'width': 1280, 'height': 720},
+            {'id': 'wide', 'label': 'Display 3 (wide)', 'x': 1920, 'y': 0,
+             'width': 3200, 'height': 1200},
+            {'id': 'virtual', 'label': 'Display 4 (virtual)', 'x': -800, 'y': -600,
+             'width': 800, 'height': 600}])
+        from engine.recording import RecordingEngine
+        with patch.object(self.module.subprocess, 'run', return_value=result):
+            for monitor in monitors:
+                self.assertEqual(RecordingEngine().get_monitor_geometry(monitor['id']),
+                                 (monitor['x'], monitor['y'], monitor['width'], monitor['height']))
+                with self.assertRaises(ValueError):
+                    RecordingEngine().get_monitor_geometry(monitor['label'])
+        run.assert_called_once_with(['xrandr', '--listmonitors'], capture_output=True,
+                                    text=True, check=True, timeout=5)
+
+    def test_monitor_detection_skips_malformed_geometry_and_handles_failure(self):
+        result = Mock(stdout='Monitors: 2\n 0: +bad invalid bad\n 1: +DP-8 80x60+1+2 DP-8\n')
+        with patch.object(self.module.subprocess, 'run', return_value=result):
+            self.assertEqual(self.module.get_connected_monitors()[0]['label'],
+                             'Display 2 (DP-8)')
+        for error in (OSError('missing'), self.module.subprocess.TimeoutExpired('xrandr', 5)):
+            with patch.object(self.module.subprocess, 'run', side_effect=error):
+                self.assertEqual(self.module.get_connected_monitors(), [])
+
     def test_negative_monitor_offsets_parsed(self):
         result = Mock(stdout='Monitors: 1\n 0: +DP-1 101/1x99/1-100+20 DP-1\n')
         with patch.object(self.module.subprocess, 'run', return_value=result):
@@ -311,7 +349,9 @@ class InertRadio(InertWidget):
 
     @classmethod
     def new_with_label(cls, first, text):
-        return cls(first)
+        button = cls(first)
+        button.label = text
+        return button
 
     new_with_label_from_widget = new_with_label
 
@@ -364,6 +404,7 @@ def construction_gtk():
         IconSize=SimpleNamespace(BUTTON=1),
         Orientation=SimpleNamespace(VERTICAL=0, HORIZONTAL=1),
         WindowPosition=SimpleNamespace(CENTER=0),
+        Align=SimpleNamespace(START=0),
     )
 
 
@@ -406,6 +447,219 @@ class MainPreferencesTests(unittest.TestCase):
         self.module.Gtk.FileChooserAction = SimpleNamespace(SELECT_FOLDER=2)
         self.module.Gtk.ResponseType = SimpleNamespace(CANCEL=0, ACCEPT=1)
         return dialog
+
+    def rename_dialog(self, text='  Work display  ', response=1):
+        dialog, entry = Mock(), Mock()
+        dialog.run.return_value = response
+        entry.get_text.return_value = text
+        self.module.Gtk.Dialog = Mock(return_value=dialog)
+        self.module.Gtk.Entry = Mock(return_value=entry)
+        self.module.Gtk.ResponseType = SimpleNamespace(CANCEL=0, ACCEPT=1)
+        return dialog, entry
+
+    def test_alias_restoration_hotplug_and_capture_identity(self):
+        saved = self.Preferences(source='DP-1', monitor_names={'DP-1': 'Work display'})
+        self.loader.return_value = saved
+        ui = self.module.ScreenRecorder()
+        ui.finish_monitor_refresh(0, self.monitors(), ui.lifecycle.token)
+        self.assertEqual(ui.source['DP-1'].label, 'Work display')
+        self.assertEqual(ui.get_options().source, 'DP-1')
+        ui.refresh_monitors([])
+        self.assertEqual(ui.get_selected(ui.source), 'region')
+        ui.rename_monitor_button.set_sensitive.assert_called_with(False)
+        self.assertEqual(ui.preferences, saved)
+        ui.refresh_monitors(self.monitors())
+        self.assertEqual(ui.source['DP-1'].label, 'Work display')
+        ui.rename_monitor_button.set_sensitive.assert_called_with(True)
+        self.saver.assert_not_called()
+
+    def test_reserved_monitor_ids_preserve_region_rename_restore_and_hotplug(self):
+        result = Mock(stdout=('Monitors: 4\n'
+            ' 0: +region 800x600+0+0\n'
+            ' 1: +monitor:region 800x600+800+0 DP-3 DP-4\n'
+            ' 2: +monitor:monitor:region 800x600+1600+0\n'
+            ' 3: +normal 800x600+2400+0 DP-2\n'))
+        with patch.object(self.module.subprocess, 'run', return_value=result):
+            monitors = self.module.get_connected_monitors()
+        self.ui.preferences = self.Preferences()
+        self.ui.refresh_monitors(monitors)
+        self.assertEqual(set(self.ui.source), {'region', 'monitor:region',
+            'monitor:monitor:region', 'monitor:monitor:monitor:region', 'normal'})
+        self.assertEqual(self.ui.source['region'].label, 'Select region')
+        self.assertIsNone(self.ui.selected_connected_monitor())
+        for raw_id, token in (('region', 'monitor:region'),
+                              ('monitor:region', 'monitor:monitor:region'),
+                              ('monitor:monitor:region', 'monitor:monitor:monitor:region')):
+            with self.subTest(raw_id=raw_id):
+                self.ui.source[token].clicked()
+                self.assertEqual(self.ui.preferences.source, token)
+                self.assertEqual(self.ui.get_options().source, token)
+                self.assertEqual(self.ui.selected_connected_monitor()['id'], raw_id)
+                self.rename_dialog(text='Work display')
+                self.ui.on_rename_monitor_clicked(None)
+                self.assertEqual(self.ui.preferences.monitor_names[raw_id], 'Work display')
+                saved = self.ui.preferences
+                self.loader.return_value = saved
+                restored = self.module.ScreenRecorder()
+                restored.refresh_monitors(monitors)
+                self.assertEqual(restored.get_selected(restored.source), token)
+                self.assertEqual(restored.source[token].label, 'Work display')
+                restored.refresh_monitors([])
+                self.assertEqual(restored.get_selected(restored.source), 'region')
+                self.assertIsNone(restored.selected_connected_monitor())
+                self.assertEqual(restored.preferences, saved)
+                restored.refresh_monitors(monitors)
+                self.assertEqual(restored.selected_connected_monitor()['id'], raw_id)
+        self.ui.source['region'].clicked()
+        self.assertEqual(self.ui.preferences.source, 'region')
+        self.assertIsNone(self.ui.selected_connected_monitor())
+        self.ui.rename_monitor_button.set_sensitive.assert_called_with(False)
+
+    def test_mixed_monitor_and_output_names_keep_distinct_selection_and_capture(self):
+        result = Mock(stdout=('Monitors: 2\n'
+            ' 0: DP-2 800x600+0+0\n'
+            ' 1: right 1280x720+800+0 DP-2\n'))
+        with patch.object(self.module.subprocess, 'run', return_value=result):
+            monitors = self.module.get_connected_monitors()
+        self.assertEqual([monitor['id'] for monitor in monitors], ['DP-2', 'right'])
+        self.ui.preferences = self.Preferences(monitor_names={
+            'DP-2': 'Left display', 'right': 'Right display'})
+        self.ui.refresh_monitors(monitors)
+        self.assertEqual(self.ui.source['DP-2'].label, 'Left display')
+        self.assertEqual(self.ui.source['right'].label, 'Right display')
+        self.ui.source['right'].clicked()
+        self.assertEqual(self.ui.preferences.source, 'right')
+        self.assertEqual(self.ui.get_options().source, 'right')
+        from engine.recording import RecordingEngine
+        with patch.object(self.module.subprocess, 'run', return_value=result):
+            self.assertEqual(RecordingEngine().get_monitor_geometry(self.ui.get_options().source),
+                             (800, 0, 1280, 720))
+        self.rename_dialog(text='Work display')
+        self.ui.on_rename_monitor_clicked(None)
+        self.assertEqual(self.ui.preferences.monitor_names,
+                         {'DP-2': 'Left display', 'right': 'Work display'})
+        self.loader.return_value = self.ui.preferences
+        restored = self.module.ScreenRecorder()
+        restored.refresh_monitors(monitors)
+        self.assertEqual(restored.get_selected(restored.source), 'right')
+        self.assertEqual(restored.selected_connected_monitor()['id'], 'right')
+        restored.refresh_monitors([])
+        self.assertEqual(restored.get_selected(restored.source), 'region')
+        restored.refresh_monitors(monitors)
+        self.assertEqual(restored.source['right'].label, 'Work display')
+        self.assertEqual(restored.get_selected(restored.source), 'right')
+
+    def test_rename_persists_candidate_before_ui_update_and_blank_resets(self):
+        self.ui.refresh_monitors(self.monitors())
+        dialog, entry = self.rename_dialog()
+        before = self.ui.preferences
+        def save(candidate):
+            self.assertIs(self.ui.preferences, before)
+            self.assertEqual(self.ui.source['DP-1'].label, 'DisplayPort')
+            self.assertEqual(candidate.monitor_names, {'DP-1': 'Work display'})
+            return True
+        self.saver.side_effect = save
+        self.ui.on_rename_monitor_clicked(None)
+        entry.set_text.assert_called_once_with('')
+        dialog.destroy.assert_called_once()
+        self.assertEqual(self.ui.source['DP-1'].label, 'Work display')
+        self.assertEqual(self.ui.get_options().source, 'DP-1')
+        self.assertEqual(before.monitor_names, {})
+        self.saver.side_effect = None
+        dialog, entry = self.rename_dialog(text='  ')
+        self.ui.on_rename_monitor_clicked(None)
+        entry.set_text.assert_called_once_with('Work display')
+        self.assertEqual(self.ui.preferences.monitor_names, {})
+        self.assertEqual(self.ui.source['DP-1'].label, 'DisplayPort')
+        self.assertEqual(self.saver.call_count, 2)
+
+    def test_rename_preserves_disconnected_aliases_and_unrelated_preferences(self):
+        from dataclasses import replace
+        self.ui.preferences = replace(self.saved, monitor_names={'unplugged': 'Spare'})
+        self.ui.refresh_monitors(self.monitors())
+        self.rename_dialog(text='参考画面')
+        self.ui.on_rename_monitor_clicked(None)
+        self.assertEqual(self.ui.preferences, replace(self.saved, monitor_names={
+            'unplugged': 'Spare', 'DP-1': '参考画面'}))
+        # A failed discovery returns an empty list, just like an unplug event.
+        with patch.object(self.module.subprocess, 'run', side_effect=OSError('missing')):
+            monitors = self.module.get_connected_monitors()
+        self.ui.finish_monitor_refresh(0, monitors, self.ui.lifecycle.token)
+        self.assertEqual(self.ui.get_selected(self.ui.source), 'region')
+        self.assertEqual(self.ui.preferences.monitor_names['DP-1'], '参考画面')
+        self.ui.finish_monitor_refresh(0, self.monitors(), self.ui.lifecycle.token)
+        self.assertEqual(self.ui.source['DP-1'].label, '参考画面')
+        self.assertEqual(self.saver.call_count, 1)
+
+    def test_rename_cancel_save_error_and_dialog_error_leave_labels_unchanged(self):
+        self.ui.refresh_monitors(self.monitors())
+        for mode in ('cancel', 'save-error', 'dialog-error', 'invalid-name'):
+            with self.subTest(mode=mode):
+                self.saver.reset_mock()
+                dialog, entry = self.rename_dialog(response=0 if mode == 'cancel' else 1)
+                self.saver.return_value = mode != 'save-error'
+                if mode == 'dialog-error':
+                    dialog.run.side_effect = RuntimeError('dialog unavailable')
+                if mode == 'invalid-name':
+                    entry.get_text.return_value = 'bad\x00name'
+                self.ui.on_rename_monitor_clicked(None)
+                self.assertEqual(self.ui.preferences, self.saved)
+                self.assertEqual(self.ui.source['DP-1'].label, 'DisplayPort')
+                dialog.destroy.assert_called_once()
+                if mode != 'save-error':
+                    self.saver.assert_not_called()
+                if mode != 'cancel':
+                    self.assertIn('unchanged', self.ui.status.set_text.call_args.args[0])
+
+    def test_rename_never_opens_busy_closed_or_for_region(self):
+        self.ui.refresh_monitors(self.monitors())
+        for state in ('selecting', 'countdown', 'starting', 'recording', 'stopping',
+                      'cleanup_failed', 'closed'):
+            with self.subTest(state=state):
+                self.ui.lifecycle.state = state
+                self.ui.update_button()
+                self.ui.rename_monitor_button.set_sensitive.assert_called_with(False)
+                self.rename_dialog()
+                self.ui.on_rename_monitor_clicked(None)
+                self.module.Gtk.Dialog.assert_not_called()
+        self.ui.lifecycle.state = 'idle'
+        for closed in (True, False):
+            self.ui.lifecycle.closed = closed
+            if not closed:
+                self.ui.source['region'].clicked()
+                self.saver.reset_mock()
+            self.rename_dialog()
+            self.ui.on_rename_monitor_clicked(None)
+            self.module.Gtk.Dialog.assert_not_called()
+        self.saver.assert_not_called()
+
+    def test_rename_rechecks_state_token_selection_and_connection_after_modal(self):
+        for change in ('busy', 'closed', 'session-ended', 'selection', 'disconnect'):
+            with self.subTest(change=change):
+                self.ui.lifecycle.state, self.ui.lifecycle.closed = 'idle', False
+                self.ui.preferences = self.saved
+                self.ui.refresh_monitors(self.monitors())
+                self.saver.reset_mock()
+                dialog, entry = self.rename_dialog()
+                def run():
+                    if change == 'busy':
+                        self.ui.lifecycle.state = 'recording'
+                    elif change == 'closed':
+                        self.ui.lifecycle.closed = True
+                    elif change == 'session-ended':
+                        self.ui.lifecycle.token += 1
+                    elif change == 'selection':
+                        self.ui.source['region'].set_active(True)
+                        self.saver.reset_mock()
+                    else:
+                        self.ui.refresh_monitors([])
+                    return 1
+                dialog.run.side_effect = run
+                self.ui.on_rename_monitor_clicked(None)
+                self.saver.assert_not_called()
+                self.assertEqual(self.ui.preferences.monitor_names, {})
+                entry.get_text.assert_not_called()
+                dialog.destroy.assert_called_once()
 
     def test_restored_output_label_is_bounded_readable_and_snapshotted(self):
         saved = self.Preferences(output_dir='/custom clips/日本語')
@@ -604,6 +858,27 @@ class MainPreferencesTests(unittest.TestCase):
                 self.assertEqual(header.get_children(), [])
                 self.assertEqual(ui.get_selected(ui.audio), 'mic')
                 ui.connect.assert_called_once_with('delete-event', ui.on_close)
+        self.saver.assert_not_called()
+
+    def test_startup_refresh_has_initialized_lifecycle_and_rename_controls(self):
+        refresh = self.module.ScreenRecorder.refresh_monitors
+        observed = []
+        def checked_refresh(ui, monitors=None):
+            # InertWidget.__getattr__ otherwise hides missing startup attributes.
+            self.assertIn('lifecycle', vars(ui))
+            self.assertIn('source', vars(ui))
+            self.assertIn('monitors', vars(ui))
+            self.assertIn('rename_monitor_button', vars(ui))
+            self.assertEqual(ui.lifecycle.state, 'idle')
+            self.assertFalse(ui.lifecycle.closed)
+            observed.append(ui)
+            return refresh(ui, monitors)
+        with patch.object(self.module.ScreenRecorder, 'refresh_monitors',
+                          autospec=True, side_effect=checked_refresh):
+            ui = self.module.ScreenRecorder()
+        self.assertEqual(observed, [ui])
+        ui.rename_monitor_button.set_sensitive.assert_called_with(False)
+        self.assertEqual(ui.get_selected(ui.source), 'region')
         self.saver.assert_not_called()
 
     def test_constructor_restores_static_values_without_saving_implicit_activation(self):

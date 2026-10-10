@@ -139,6 +139,30 @@ class LifecycleTests(unittest.TestCase):
                              for command in commands), 2)
         self.assertEqual(self.life.state, 'idle')
 
+    def test_escaped_monitor_selection_decodes_only_at_capture_boundary(self):
+        for token, raw_id in (('monitor:region', 'region'),
+                              ('monitor:monitor:region', 'monitor:region'),
+                              ('monitor:monitor:monitor:region', 'monitor:monitor:region'),
+                              ('DP-2', 'DP-2')):
+            with self.subTest(token=token):
+                self.engine.reset_mock()
+                self.spawn_mock.reset_mock()
+                self.life.begin(RecordingOptions(token, 'none', 30, 'high'))
+                self.assertEqual(self.life.state, 'countdown')
+                self.authorize()
+                self.next_callback()
+                try:
+                    self.engine.select_region.assert_not_called()
+                    self.engine.get_monitor_geometry.assert_called_once_with(raw_id)
+                    self.assertEqual(self.engine.start.call_args.kwargs['region'], (0, 0, 100, 98))
+                    self.assertNotIn('monitor', self.engine.start.call_args.kwargs)
+                    self.assertFalse(any(str(BORDER_SCRIPT) in call.args[0]
+                                         for call in self.spawn_mock.call_args_list))
+                finally:
+                    self.life.cancel()
+                    self.finish()
+                self.assertEqual(self.life.state, 'idle')
+
     def test_output_folder_snapshot_forwarded_to_engine(self):
         options = RecordingOptions('monitor', 'none', 30, 'high', '/custom clips/日本語')
         self.life.begin(options)

@@ -36,6 +36,11 @@ def normalize_geometry(geometry):
     return x, y, width, height
 
 
+def monitor_identity(parts):
+    """Use the unique logical-name namespace, independent of output count."""
+    return parts[1].lstrip('+*')
+
+
 class RecordingEngine:
     def __init__(self):
         self.process = None
@@ -54,7 +59,12 @@ class RecordingEngine:
         for line in result.stdout.splitlines()[1:]:
             parts = line.split()
 
-            if len(parts) < 4 or parts[-1] != monitor_name:
+            if len(parts) < 3:
+                continue
+
+            # Output names are a separate namespace and can shadow an exact
+            # logical-name match. Discovery and capture use only logical IDs.
+            if monitor_name != monitor_identity(parts):
                 continue
 
             match = re.fullmatch(

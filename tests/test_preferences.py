@@ -45,15 +45,57 @@ class PreferencesTests(unittest.TestCase):
         document = json.loads(self.path.read_text(encoding='utf-8'))
         self.assertEqual(document, {'version': 1, 'source': 'DP-1',
                                     'audio': 'mic', 'fps': 60, 'quality': 'normal',
-                                    'output_dir': expected.output_dir})
+                                    'output_dir': expected.output_dir, 'monitor_names': {}})
         self.assertIs(type(document['fps']), int)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
+    def test_source_selection_tokens_roundtrip_without_alias_key_changes(self):
+        from preferences import monitor_source_token, source_monitor_id
+        cases = {'DP-2': 'DP-2', 'region': 'monitor:region',
+                 'monitor:region': 'monitor:monitor:region',
+                 'monitor:monitor:region': 'monitor:monitor:monitor:region'}
+        self.assertIsNone(source_monitor_id('region'))
+        self.assertIsNone(source_monitor_id(None))
+        for identity, token in cases.items():
+            with self.subTest(identity=identity):
+                self.assertEqual(monitor_source_token(identity), token)
+                self.assertEqual(source_monitor_id(token), identity)
+                expected = Preferences(source=token, monitor_names={identity: 'Work display'})
+                self.assertTrue(save_preferences(expected, self.path))
+                self.assertEqual(load_preferences(self.path), expected)
+
+    def test_monitor_names_roundtrip_and_independent_defaults(self):
+        first, second = Preferences(), Preferences()
+        first.monitor_names['DP-7'] = 'Work display'
+        self.assertEqual(second.monitor_names, {})
+        expected = Preferences(source='DP-7', monitor_names={
+            'DP-7': 'Work display', 'HDMI-9': '参考画面', 'unplugged': 'Spare'})
+        self.assertTrue(save_preferences(expected, self.path))
+        self.assertEqual(load_preferences(self.path), expected)
+        self.assertEqual(json.loads(self.path.read_text())['monitor_names'],
+                         expected.monitor_names)
+
+    def test_monitor_names_validate_entries_without_discarding_other_fields(self):
+        self.write_document({'version': 1, 'fps': 60, 'monitor_names': {
+            'DP-7': '  Work display  ', 'HDMI-9': '参考画面', '': 'Empty key',
+            ' ': 'Blank key', 'invalid': 4, 'blank': '  ', 'null': None,
+            'bad\x00key': 'Bad key', 'bad-value': 'bad\x00name'}})
+        restored = load_preferences(self.path)
+        self.assertEqual(restored.monitor_names,
+                         {'DP-7': 'Work display', 'HDMI-9': '参考画面'})
+        self.assertEqual(restored.fps, 60)
+        for value in (None, [], 'name', 7, True):
+            self.write_document({'version': 1, 'fps': 60, 'monitor_names': value})
+            self.assertEqual(load_preferences(self.path), Preferences(fps=60))
+
     def test_atomic_replace_failure_keeps_old_settings_and_cleans_temporary_file(self):
-        self.assertTrue(save_preferences(Preferences(), self.path))
+        original_preferences = Preferences(monitor_names={'DP-7': 'Work display'})
+        self.assertTrue(save_preferences(original_preferences, self.path))
         original = self.path.read_bytes()
         with patch('preferences.os.replace', side_effect=OSError('denied')):
-            self.assertFalse(save_preferences(Preferences(audio='none'), self.path))
+            self.assertFalse(save_preferences(Preferences(monitor_names={'DP-7': 'New name'}),
+                                              self.path))
+        self.assertEqual(load_preferences(self.path), original_preferences)
         self.assertEqual(self.path.read_bytes(), original)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 

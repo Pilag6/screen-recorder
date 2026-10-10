@@ -162,6 +162,53 @@ class EngineTests(unittest.TestCase):
         with patch('engine.recording.subprocess.run', return_value=result):
             self.assertEqual(engine.get_monitor_geometry('DP-1'), (-100, 20, 101, 99))
 
+    def test_monitor_resolves_logical_names_for_every_output_count(self):
+        result = Mock(stdout=('Monitors: 3\n'
+            ' 0: +*internal 1920/300x1080/200+0+0 eDP-7\n'
+            ' 1: +wide 3200/600x1200/250+1920-20 DP-3 DP-4\n'
+            ' 2: +*virtual 800x600-800-600\n'))
+        expected = {'internal': (0, 0, 1920, 1080),
+                    'wide': (1920, -20, 3200, 1200), 'virtual': (-800, -600, 800, 600)}
+        with patch('engine.recording.subprocess.run', return_value=result):
+            for identity, geometry in expected.items():
+                with self.subTest(identity=identity):
+                    self.assertEqual(RecordingEngine().get_monitor_geometry(identity), geometry)
+            for invalid in ('eDP-7', 'DP-3', 'DP-4', 'Display 1 (internal)', 'Work display', 'missing'):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'Monitor not found'):
+                    RecordingEngine().get_monitor_geometry(invalid)
+
+    def test_single_output_connector_cannot_shadow_another_logical_name(self):
+        result = Mock(stdout=('Monitors: 2\n'
+            ' 0: +DP-2 1920x1080+0+0 DP-1\n'
+            ' 1: +right 1280x720+1920+0 DP-2\n'))
+        with patch('engine.recording.subprocess.run', return_value=result):
+            self.assertEqual(RecordingEngine().get_monitor_geometry('DP-2'), (0, 0, 1920, 1080))
+            self.assertEqual(RecordingEngine().get_monitor_geometry('right'), (1920, 0, 1280, 720))
+            with self.assertRaisesRegex(ValueError, 'Monitor not found'):
+                RecordingEngine().get_monitor_geometry('DP-1')
+
+    def test_mixed_output_namespace_collision_resolves_exact_logical_names(self):
+        rows = (' 0: DP-2 800x600+0+0\n', ' 1: right 1280x720+800+0 DP-2\n')
+        for ordered in (rows, rows[::-1]):
+            with self.subTest(rows=ordered), \
+                 patch('engine.recording.subprocess.run', return_value=Mock(stdout='Monitors: 2\n' + ''.join(ordered))):
+                self.assertEqual(RecordingEngine().get_monitor_geometry('DP-2'), (0, 0, 800, 600))
+                self.assertEqual(RecordingEngine().get_monitor_geometry('right'), (800, 0, 1280, 720))
+
+    def test_logical_monitor_invalid_geometry_and_detection_errors_are_not_hidden(self):
+        for row, identity in ((' 0: +virtual invalid', 'virtual'),
+                              (' 0: +wide invalid DP-3 DP-4', 'wide'),
+                              (' 0: +internal invalid eDP-7', 'internal')):
+            with self.subTest(row=row), \
+                 patch('engine.recording.subprocess.run', return_value=Mock(stdout='Monitors: 1\n' + row)), \
+                 self.assertRaisesRegex(ValueError, 'Invalid monitor geometry'):
+                RecordingEngine().get_monitor_geometry(identity)
+        for error in (OSError('missing'), subprocess.TimeoutExpired('xrandr', 5)):
+            with self.subTest(error=error), \
+                 patch('engine.recording.subprocess.run', side_effect=error), \
+                 self.assertRaises(type(error)):
+                RecordingEngine().get_monitor_geometry('virtual')
+
     def test_exited_ffmpeg_is_reaped_by_stop(self):
         engine = RecordingEngine()
         engine.process = Mock()
