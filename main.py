@@ -23,8 +23,8 @@ from engine.notifications import DesktopNotifier
 
 MONITOR_NAMES = {
     "eDP": "Acer",
-    "DVI-I-3-2": "LG derecha",
-    "DVI-I-2-1": "Samsung arriba",
+    "DVI-I-3-2": "Samsung arriba",
+    "DVI-I-2-1": "LG derecha",
 }
 
 def get_connected_monitors():
