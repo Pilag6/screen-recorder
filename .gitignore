@@ -10,3 +10,14 @@ venv/
 # Editor files
 *.swp
 *.swo
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
