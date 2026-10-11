@@ -45,8 +45,8 @@ class InstallationTests(unittest.TestCase):
         self.layout = installation.Layout.from_environment()
         self.source = self.base / 'checkout'
         self.source.mkdir()
-        for name in ('main.py', 'recorder.py', 'preferences.py',
-                     'installation.py', 'uninstall.sh'):
+        for name in ('main.py', 'recorder.py', 'preferences.py', 'version.py',
+                     'LICENSE', 'THIRD_PARTY.md', 'installation.py', 'uninstall.sh'):
             shutil.copyfile(ROOT / name, self.source / name)
         for name in ('engine', 'helpers', 'assets'):
             shutil.copytree(ROOT / name, self.source / name,
@@ -66,7 +66,8 @@ class InstallationTests(unittest.TestCase):
         first = self.layout.manifest.read_bytes()
         self.install()
         self.assertEqual(first, self.layout.manifest.read_bytes())
-        expected = {'main.py', 'recorder.py', 'preferences.py', 'installation.py', 'uninstall.sh'}
+        expected = {'main.py', 'recorder.py', 'preferences.py', 'version.py',
+                    'LICENSE', 'THIRD_PARTY.md', 'installation.py', 'uninstall.sh'}
         for directory, pattern in (('engine', '**/*.py'), ('helpers', '*.py'), ('assets', '*')):
             expected.update(str(path.relative_to(self.source))
                             for path in (self.source / directory).glob(pattern))
@@ -81,6 +82,37 @@ class InstallationTests(unittest.TestCase):
         self.assertIn('io.github.screenrecorder.ScreenRecorder',
                       (self.layout.payload / 'main.py').read_text())
         self.assertTrue(os.access(self.layout.launcher, os.X_OK))
+
+    def test_release_metadata_payload(self):
+        payload = installation.collect_payload(ROOT)
+        for name in ('version.py', 'LICENSE', 'THIRD_PARTY.md'):
+            with self.subTest(name=name):
+                key = 'payload/' + name
+                self.assertIn(key, set(payload))
+                content, mode = payload[key]
+                self.assertEqual(content, (ROOT / name).read_bytes())
+                self.assertEqual(mode, 0o644)
+                self.assertEqual(self.layout.target(key), self.layout.payload / name)
+
+    def test_missing_release_metadata_refused_before_writes(self):
+        for name in ('version.py', 'LICENSE', 'THIRD_PARTY.md'):
+            with self.subTest(name=name):
+                path = self.source / name
+                content = path.read_bytes()
+                path.unlink()
+                with self.assertRaisesRegex(installation.InstallError, 'missing runtime file'):
+                    self.install()
+                self.assertFalse(self.layout.payload.exists())
+                path.write_bytes(content)
+
+    def test_installed_version_independent_of_checkout(self):
+        (self.source / 'main.py').write_text('from version import VERSION\nprint(VERSION)\n')
+        self.install()
+        self.source.rename(self.base / 'unavailable checkout')
+        result = subprocess.run([str(self.layout.launcher)], cwd=self.base,
+                                env=self.env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '1.0.0')
 
     def test_missing_owned_files_restored_without_duplicate_entries(self):
         self.install()

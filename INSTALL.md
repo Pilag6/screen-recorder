@@ -1,9 +1,15 @@
 # Install Screen Recorder independently of its checkout
 
-These scripts provide a **user-local X11 installation** for Mint Cinnamon/Ubuntu.
+These scripts provide a **user-local X11 installation** targeting Linux Mint
+Cinnamon, with Mint/Ubuntu dependency guidance.
 They copy the runtime, create a launcher and menu entry, and never start the app,
 install packages, configure shortcuts, change audio settings, or record anything.
 No administrator privileges or virtualenv are needed.
+
+Application version `1.0.0` is defined in GTK-independent `version.py`.
+This is release preparation, not a published download: publication remains
+blocked until icon/helper distribution rights and an existing repository origin
+are confirmed. See [THIRD_PARTY.md](THIRD_PARTY.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## Future installation and manual activation
 
@@ -51,8 +57,9 @@ without executing those tools. Its isolated system-Python probe imports GI,
 GTK3/GdkX11 and Cairo bindings without initializing GTK or opening a window.
 Missing requirements are reported with a nonzero exit status. Uninstall does
 not need GTK or recording dependencies. This check does not prove that a display,
-audio server, codecs, or permissions will be usable later. Wayland recording is
-not supported by this X11 runtime.
+audio server, codecs, or permissions will be usable later. FFmpeg must support
+`x11grab` and `libx264`, plus Pulse input and AAC for audio capture. Wayland
+recording is not supported by this X11 runtime.
 
 ## Locations and identity
 
@@ -76,10 +83,18 @@ as `%%`. This avoids GLib/Gio rejecting a percent-containing executable path
 before field-code expansion. There is no `sh -c` or evaluation of the path as
 shell code; the launcher still selects `/usr/bin/python3`.
 
-The payload includes `main.py`, `recorder.py`, `preferences.py`, all
-`engine/**/*.py`, `helpers/*.py`, and direct asset files. Runtime files are
-byte-for-byte copies, including the pinned REC helper. The installer does not
-modify the application's singleton ID: `io.github.screenrecorder.ScreenRecorder`.
+The payload includes `main.py`, `recorder.py`, `preferences.py`, `version.py`,
+`installation.py`, `uninstall.sh`, `LICENSE`, `THIRD_PARTY.md`, all
+`engine/**/*.py`, `helpers/*.py`, and direct asset files. These are byte-for-byte
+copies, including the pinned REC helper. The license covers original project
+code only; copying the icon/helpers does not resolve their rights or assign MIT.
+Version metadata and both notices are required payload files and participate in
+the same ownership checks and safe uninstall as runtime files.
+
+The installer does not modify the application's singleton ID:
+`io.github.screenrecorder.ScreenRecorder`. That ID, the ownership marker's `v1`
+and the preference JSON's `version: 1` are identity/schema identifiers, not
+application release versions.
 
 The compatible desktop filename remains `screen-recorder.desktop`, with
 `StartupWMClass=io.github.screenrecorder.ScreenRecorder` and
@@ -147,11 +162,15 @@ subsequent install/uninstall will refuse to adopt it.
 dependency doubles, and a harmless launcher fixture, never the recording GUI.
 It covers repeat installation, payload fidelity, source-independent execution,
 escaping, ownership collisions, traversal/symlink refusal and preservation during
-uninstall. When GI/Gio is available, real `Gio.DesktopAppInfo` tests parse percent
-and combined-punctuation paths and launch only an inert Python fixture, checking
+uninstall, including version/license/notice fidelity, missing-metadata refusal and
+checkout-independent access to the installed version. `tests/test_version.py`
+checks `1.0.0` without importing GTK or application code. When GI/Gio is available,
+real `Gio.DesktopAppInfo` tests parse percent and combined-punctuation paths and
+launch only an inert Python fixture, checking
 its payload path, arguments and isolated HOME/XDG environment. These regressions
 are skipped only when GI/Gio is unavailable; the custom escaping decoder alone
 is not evidence of desktop compatibility. Shell syntax and Python syntax checks
 do not activate the app.
 Real installation, GUI grouping, audio operation and recording are intentionally
-outside this verification and remain future, explicit user actions.
+outside this verification and remain future, explicit user actions. Manual
+installation on a second computer and Cinnamon grouping/pinning are unverified.

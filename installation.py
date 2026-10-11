@@ -13,6 +13,7 @@ import tempfile
 
 
 APP_ID = 'io.github.screenrecorder.ScreenRecorder'
+# Ownership format identifier, not the application release version.
 MARKER = 'screen-recorder installer: ' + APP_ID + ' v1'
 PYTHON = '/usr/bin/python3'
 MANIFEST = '.screen-recorder-install.json'
@@ -92,7 +93,8 @@ def runtime_name(name):
         return False
     if any(ord(c) < 32 or ord(c) == 127 for c in name):
         return False
-    if name in ('main.py', 'recorder.py', 'preferences.py', 'installation.py', 'uninstall.sh'):
+    if name in ('main.py', 'recorder.py', 'preferences.py', 'version.py',
+                'LICENSE', 'THIRD_PARTY.md', 'installation.py', 'uninstall.sh'):
         return True
     parts = path.parts
     return (len(parts) >= 2 and parts[0] == 'engine' and path.suffix == '.py'
@@ -198,7 +200,8 @@ def desktop_argument(value):
 
 def collect_payload(source):
     safe_path(source)
-    names = ['main.py', 'recorder.py', 'preferences.py', 'installation.py', 'uninstall.sh']
+    names = ['main.py', 'recorder.py', 'preferences.py', 'version.py',
+             'LICENSE', 'THIRD_PARTY.md', 'installation.py', 'uninstall.sh']
     for directory in ('engine', 'helpers', 'assets'):
         base = source / directory
         safe_path(base)
