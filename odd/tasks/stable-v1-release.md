@@ -10,9 +10,9 @@ No recordings, real installation/uninstallation, launcher/icon/shortcut or audio
 Clean feat/recording-lifecycle at 98c21a4; main e30d859 is an ancestor (14 commits behind). No configured origin or other remote. GitHub authentication exists, but owned-repository lookup found no matching repository. Icon and previously copied helpers have no recorded independent provenance/license evidence. This is a publication prerequisite, not proof that they are third-party or unlicensed.
 
 ## Tasks
-- [ ] T1 Prepare README, MIT LICENSE, provenance notice, release notes and central version metadata with portable payload coverage. Artifacts prepared; focused RED/GREEN passed (1 version test, 30 installation tests). Awaiting full verification and work-unit commit.
-- [ ] T2 Independently run full tests, Python/Bash syntax, whitespace, tracked-file hygiene, docs/payload consistency and scoped review. Automated verification passed; awaiting work-unit commit.
-- [ ] T3 Commit verified preparation, integrate non-destructively into main and create annotated v1.0.0 tag if safe; publish only with existing verified origin and distribution rights. Pending.
+- [x] T1 Prepare README, MIT LICENSE, provenance notice, release notes and central version metadata with portable payload coverage. Completed and verified; commit ffa27b11368ac03b5d97e89b5d4abd05392a96a6. Focused RED/GREEN passed (1 version test, 30 installation tests). Full verification passed.
+- [x] T2 Independently run full tests, Python/Bash syntax, whitespace, tracked-file hygiene, docs/payload consistency and scoped review. Completed with independent automated verification; evidence included in work-unit commit ffa27b11368ac03b5d97e89b5d4abd05392a96a6. Native review remains unavailable, not approved.
+- [ ] T3 Commit verified preparation, integrate non-destructively into main and create annotated v1.0.0 tag if safe; publish only with existing verified origin and distribution rights. In progress for local integration/tag; publication blocked, not complete.
 
 ## Checks and acceptance
 No UI/recording behavior changes. Version is centrally defined and included in the installation. README and INSTALL accurately describe dependencies/features/limitations. Fresh automated checks must pass; report any skips. Native review obeys the user-owned switch and does not force blocked review-risk. Missing origin and unresolved asset provenance block GitHub publication, not safe local preparation.
@@ -25,4 +25,6 @@ Native review: inspect/start created review-7cc119997b895df1; selected review-re
 
 T1 passive docs have no meaningful RED; metadata/payload tests observed RED and GREEN (1 version and 30 installer tests). Independent verifier observed full GREEN.
 
-Next: user-authorized release preparation commit, fast-forward main, local annotated tag. GitHub publication blocked by absent origin and unresolved resource distribution rights; no repository will be created.
+Release work-unit commit: ffa27b11368ac03b5d97e89b5d4abd05392a96a6. Tracking closeout is a separate documentation-only commit before local integration/tag. Next local operations: fast-forward existing main and annotate v1.0.0 at the verified release/closeout tree. Their observed final identities are retained in the Engram session summary and final report, avoiding a self-referential tag/commit record.
+
+Publication remains incomplete: obtain the actual existing GitHub repository URL for origin and verifiable resource rights. No repository is created. No GitHub URL, push or Release is claimed. Real second-computer installation and Cinnamon grouping are still manual validation follow-ups, not deferred release-documentation tasks.
