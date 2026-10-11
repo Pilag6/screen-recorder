@@ -23,7 +23,10 @@ def load_main(gtk=None, pixbuf=None):
     repository = ModuleType('gi.repository')
     repository.Gtk = gtk or SimpleNamespace(Window=object, Application=InertApplication,
                                             main_quit=Mock())
-    repository.Gdk = SimpleNamespace()
+    repository.Gdk = SimpleNamespace(
+        EventType=SimpleNamespace(ENTER_NOTIFY=1, LEAVE_NOTIFY=2),
+        Cursor=SimpleNamespace(new_from_name=Mock()),
+    )
     repository.Pango = SimpleNamespace(EllipsizeMode=SimpleNamespace(MIDDLE=2))
     repository.GLib = SimpleNamespace(idle_add=Mock(), timeout_add_seconds=Mock(),
                                       Error=RuntimeError)
@@ -400,11 +403,12 @@ def construction_gtk():
         Button=InertWidget, Separator=InertWidget, RadioButton=InertRadio,
         HeaderBar=InertWidget,
         Image=SimpleNamespace(new_from_pixbuf=Mock(return_value=InertWidget()),
-                              new_from_icon_name=Mock(return_value=InertWidget())),
+                              new_from_icon_name=Mock(side_effect=lambda name, size:
+                                  SimpleNamespace(icon_name=name, icon_size=size))),
         IconSize=SimpleNamespace(BUTTON=1),
         Orientation=SimpleNamespace(VERTICAL=0, HORIZONTAL=1),
         WindowPosition=SimpleNamespace(CENTER=0),
-        Align=SimpleNamespace(START=0),
+        Align=SimpleNamespace(START=0, END=1),
     )
 
 
@@ -456,6 +460,76 @@ class MainPreferencesTests(unittest.TestCase):
         self.module.Gtk.Entry = Mock(return_value=entry)
         self.module.Gtk.ResponseType = SimpleNamespace(CANCEL=0, ACCEPT=1)
         return dialog, entry
+
+    def rename_signal(self, signal):
+        callbacks = [call.args[1]
+                     for call in self.ui.rename_monitor_button.connect.call_args_list
+                     if call.args[0] == signal]
+        self.assertEqual(len(callbacks), 1)
+        return callbacks[0]
+
+    def test_rename_button_keeps_right_alignment_and_visible_edit_icon(self):
+        button = self.ui.rename_monitor_button
+        button.set_halign.assert_called_once_with(self.module.Gtk.Align.END)
+        image = button.set_image.call_args.args[0]
+        self.assertEqual((image.icon_name, image.icon_size),
+                         ('document-edit-symbolic', self.module.Gtk.IconSize.BUTTON))
+        button.set_always_show_image.assert_called_once_with(True)
+        self.saver.assert_not_called()
+
+    def test_rename_pointer_on_sensitive_enter_and_reset_on_leave(self):
+        button = self.ui.rename_monitor_button
+        button.get_sensitive.return_value = True
+        enter = SimpleNamespace(type=self.module.Gdk.EventType.ENTER_NOTIFY)
+        leave = SimpleNamespace(type=self.module.Gdk.EventType.LEAVE_NOTIFY)
+        self.rename_signal('enter-notify-event')(button, enter)
+        self.module.Gdk.Cursor.new_from_name.assert_called_once_with(
+            button.get_display.return_value, 'pointer')
+        button.get_window.return_value.set_cursor.assert_called_once_with(
+            self.module.Gdk.Cursor.new_from_name.return_value)
+        self.rename_signal('leave-notify-event')(button, leave)
+        button.get_window.return_value.set_cursor.assert_called_with(None)
+        self.assertEqual(self.module.Gdk.Cursor.new_from_name.call_count, 1)
+
+    def test_rename_insensitive_enter_resets_cursor_without_creating_pointer(self):
+        button = self.ui.rename_monitor_button
+        button.get_sensitive.return_value = False
+        self.rename_signal('enter-notify-event')(
+            button, SimpleNamespace(type=self.module.Gdk.EventType.ENTER_NOTIFY))
+        button.get_window.return_value.set_cursor.assert_called_once_with(None)
+        self.module.Gdk.Cursor.new_from_name.assert_not_called()
+        button.get_display.assert_not_called()
+
+    def test_rename_sensitivity_notification_clears_pointer(self):
+        button = self.ui.rename_monitor_button
+        enter = SimpleNamespace(type=self.module.Gdk.EventType.ENTER_NOTIFY)
+        for sensitive in (False, True):
+            with self.subTest(sensitive=sensitive):
+                button.get_sensitive.return_value = True
+                self.rename_signal('enter-notify-event')(button, enter)
+                button.get_window.return_value.set_cursor.assert_called_with(
+                    self.module.Gdk.Cursor.new_from_name.return_value)
+                button.get_sensitive.return_value = sensitive
+                button.get_window.return_value.set_cursor.reset_mock()
+                self.module.Gdk.Cursor.new_from_name.reset_mock()
+                self.rename_signal('notify::sensitive')(button, object())
+                button.get_window.return_value.set_cursor.assert_called_once_with(None)
+                self.module.Gdk.Cursor.new_from_name.assert_not_called()
+
+    def test_rename_cursor_callbacks_are_safe_before_realization(self):
+        button = self.ui.rename_monitor_button
+        button.get_window.return_value = None
+        for signal, event in (
+                ('enter-notify-event', SimpleNamespace(
+                    type=self.module.Gdk.EventType.ENTER_NOTIFY)),
+                ('leave-notify-event', SimpleNamespace(
+                    type=self.module.Gdk.EventType.LEAVE_NOTIFY)),
+                ('notify::sensitive', object())):
+            with self.subTest(signal=signal):
+                self.rename_signal(signal)(button, event)
+        self.module.Gdk.Cursor.new_from_name.assert_not_called()
+        button.get_display.assert_not_called()
+        button.get_sensitive.assert_not_called()
 
     def test_alias_restoration_hotplug_and_capture_identity(self):
         saved = self.Preferences(source='DP-1', monitor_names={'DP-1': 'Work display'})

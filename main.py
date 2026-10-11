@@ -104,8 +104,25 @@ class ScreenRecorder(Gtk.Window):
 
         self.source = {}
         self.monitors = []
-        self.rename_monitor_button = Gtk.Button(label='Rename display')
-        self.rename_monitor_button.set_halign(Gtk.Align.START)
+        self.rename_monitor_button = Gtk.Button(label=' Rename display')
+        self.rename_monitor_button.set_halign(Gtk.Align.END)
+        self.rename_monitor_button.set_image(
+            Gtk.Image.new_from_icon_name('document-edit-symbolic', Gtk.IconSize.BUTTON)
+        )
+        self.rename_monitor_button.set_always_show_image(True)
+
+        def update_rename_cursor(widget, event=None):
+            window = widget.get_window()
+            if window is not None:
+                hovering = event is not None and event.type == Gdk.EventType.ENTER_NOTIFY
+                cursor = (Gdk.Cursor.new_from_name(widget.get_display(), 'pointer')
+                          if hovering and widget.get_sensitive() else None)
+                window.set_cursor(cursor)
+
+        self.rename_monitor_button.connect('enter-notify-event', update_rename_cursor)
+        self.rename_monitor_button.connect('leave-notify-event', update_rename_cursor)
+        self.rename_monitor_button.connect('notify::sensitive',
+                                           lambda widget, _param: update_rename_cursor(widget))
         self.rename_monitor_button.set_tooltip_text('Rename the selected display; blank resets its name')
         self.rename_monitor_button.connect('clicked', self.on_rename_monitor_clicked)
         source_section.pack_start(self.rename_monitor_button, False, False, 0)
