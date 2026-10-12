@@ -1,3 +1,5 @@
+<img width="2172" height="724" alt="Grabador de Pantalla para Linux Mint" src="https://github.com/user-attachments/assets/50c60884-e97e-490f-bd33-db6f3b7cbda5" />
+
 # Screen Recorder
 
 A focused GTK3 screen recorder for **Linux Mint Cinnamon on X11**. Capture a
